@@ -1,0 +1,182 @@
+# SQL Investigation Cheat Sheet
+
+## Query Execution Order
+SQL does NOT execute top-to-bottom like JavaScript. Actual order:
+```
+FROM → JOIN → WHERE → GROUP BY → (aggregates computed) → HAVING → SELECT → ORDER BY → LIMIT
+```
+This explains why:
+- Aliases defined in SELECT cannot be used in WHERE or HAVING
+- Aggregate functions (COUNT, SUM) cannot be used in WHERE
+- ORDER BY can reference aliases (it runs after SELECT)
+
+---
+
+## Core Clauses
+
+### SELECT
+```sql
+SELECT column1, column2, expression AS alias
+FROM table;
+```
+- `*` returns all columns (avoid in production queries, be explicit)
+- No way to exclude specific columns in standard SQL (no `SELECT * EXCEPT`)
+- Aliases are for display and ORDER BY only, not for WHERE/HAVING
+
+### WHERE
+```sql
+WHERE column = 'value'
+WHERE column > 100
+WHERE column IS NULL
+WHERE column IS NOT NULL
+WHERE column != 'value'
+WHERE (quantity_on_hand - quantity_reserved) < 5  -- use brackets for clarity
+```
+- Filters individual rows BEFORE grouping
+- Cannot use aggregate functions here
+- Cannot reference SELECT aliases here
+- Always use IS NULL / IS NOT NULL, never = NULL or != NULL
+
+### JOIN Types
+```sql
+-- INNER JOIN (same as JOIN): only rows with matches in both tables
+FROM orders
+INNER JOIN payments ON orders.order_id = payments.order_id
+
+-- LEFT JOIN: all rows from left table, NULLs where no match on right
+FROM orders
+LEFT JOIN payments ON orders.order_id = payments.order_id
+
+-- Multiple JOINs: each gets its own ON clause
+FROM bookings
+LEFT JOIN payments ON bookings.booking_id = payments.booking_id
+LEFT JOIN sync_log ON bookings.booking_id = sync_log.booking_id
+```
+- Use LEFT JOIN when you need to find missing records (NULL on right side)
+- Never chain ON clauses: `ON table1.id = table2.id = table3.id` is invalid
+- Always use table.column notation in ON clauses for clarity
+
+### GROUP BY + HAVING
+```sql
+SELECT action_type, COUNT(action_type) AS count_action
+FROM user_activity
+GROUP BY action_type
+HAVING COUNT(action_type) > 50
+ORDER BY COUNT(action_type) DESC;
+```
+- GROUP BY groups rows, then aggregates are computed per group
+- HAVING filters groups AFTER aggregation (WHERE equivalent for groups)
+- Cannot use aliases in HAVING, must repeat the expression
+- Always comes before ORDER BY
+
+### ORDER BY
+```sql
+ORDER BY column DESC                          -- single column
+ORDER BY column1 DESC, column2 ASC           -- multiple columns
+ORDER BY ABS(difference) DESC                 -- order by expression
+ORDER BY                                      -- deprioritize cancelled orders
+  CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END,
+  ABS(difference) DESC;
+```
+- Goes at the very end of the query
+- Can reference SELECT aliases (unlike WHERE/HAVING)
+- Multiple conditions: comma-separated, evaluated left to right
+
+---
+
+## Useful Functions
+
+### ROUND
+```sql
+ROUND(SUM(order_items.line_total), 2)  -- round to 2 decimal places
+```
+- Standard SQL, works across SQLite, PostgreSQL, MySQL, SQL Server
+- Rounding in HAVING can mask small differences, consider checking raw values first
+
+### ABS
+```sql
+ORDER BY ABS(difference) DESC  -- sort by magnitude, ignoring positive/negative
+```
+- Strips the sign, treats -419 and 419 as equal magnitude
+- Essential for financial investigation where gaps can be in either direction
+
+### CASE
+```sql
+CASE WHEN condition THEN value ELSE other_value END
+```
+- Used inline in SELECT, ORDER BY, WHERE
+- Useful for conditional sorting, labeling, or categorization
+
+---
+
+## NULL Handling
+```sql
+-- Correct
+WHERE payments.payment_id IS NULL
+WHERE payments.payment_id IS NOT NULL
+
+-- Wrong (never works in any database)
+WHERE payments.payment_id = NULL
+WHERE payments.payment_id != NULL
+```
+- NULL means "unknown/missing", not zero or empty string
+- Any comparison against NULL (=, !=, >, <) returns NULL, not TRUE/FALSE
+- WHERE only includes rows where condition is TRUE, so NULL comparisons silently exclude rows
+- LEFT JOIN + IS NULL is the standard pattern for finding missing related records
+
+---
+
+## Common Investigation Patterns
+
+### Find missing related records
+```sql
+SELECT *
+FROM bookings
+LEFT JOIN payments ON bookings.booking_id = payments.booking_id
+WHERE payments.payment_id IS NULL;
+```
+
+### Find data mismatches across tables
+```sql
+SELECT orders.order_id, orders.total_amount,
+       ROUND(SUM(order_items.line_total), 2) AS sum_of_items,
+       ROUND((orders.total_amount - SUM(order_items.line_total)), 2) AS difference
+FROM orders
+LEFT JOIN order_items ON orders.order_id = order_items.order_id
+GROUP BY orders.order_id
+HAVING orders.total_amount != ROUND(SUM(order_items.line_total), 2)
+ORDER BY
+  CASE WHEN orders.order_status = 'cancelled' THEN 1 ELSE 0 END,
+  ABS(difference) DESC;
+```
+
+### Find records below a threshold
+```sql
+SELECT inventory.product_id, products.name,
+       inventory.quantity_on_hand,
+       inventory.quantity_reserved,
+       (inventory.quantity_on_hand - inventory.quantity_reserved) AS available
+FROM inventory
+LEFT JOIN products ON inventory.product_id = products.product_id
+WHERE (inventory.quantity_on_hand - inventory.quantity_reserved) < 5;
+```
+
+### Correlate failures across three tables
+```sql
+SELECT *
+FROM bookings
+LEFT JOIN payments ON bookings.booking_id = payments.booking_id
+LEFT JOIN sync_log ON bookings.booking_id = sync_log.booking_id
+WHERE sync_log.sync_status = 'failed'
+  AND (payments.payment_id IS NULL OR payments.status = 'failed');
+```
+
+---
+
+## Style Rules
+- Always use `table.column` notation in multi-table queries
+- Use brackets around expressions for clarity: `(quantity_on_hand - quantity_reserved) < 5`
+- Use `IS NULL` / `IS NOT NULL`, never `= NULL`
+- Keywords case-insensitive in SQL, but consistent casing improves readability
+- Aliases use snake_case: `sum_of_items`, not `Sum Of Items` or `'Sum of Items'`
+- One JOIN per line, aligned ON clauses for readability
