@@ -171,6 +171,53 @@ WHERE sync_log.sync_status = 'failed'
   AND (payments.payment_id IS NULL OR payments.status = 'failed');
 ```
 
+### Find orders with no valid payment (completed/shipped but unpaid)
+```sql
+SELECT *
+FROM orders
+LEFT JOIN payments ON orders.order_id = payments.order_id
+WHERE (orders.order_status = 'completed' OR orders.order_status = 'shipped')
+  AND (payments.payment_id IS NULL OR payments.payment_status = 'failed');
+```
+- Brackets are critical here: AND evaluates before OR without them, giving wrong results
+- Check payment_id IS NULL (missing row), not payment_status IS NULL (ambiguous)
+
+### Find orders where sum of payments exceeds order total (overpayment/duplicate charges)
+```sql
+SELECT orders.order_id, orders.total_amount,
+       SUM(payments.amount) AS sum_paid,
+       SUM(payments.amount) - orders.total_amount AS overpayment
+FROM orders
+LEFT JOIN payments ON orders.order_id = payments.order_id
+GROUP BY orders.order_id
+HAVING SUM(payments.amount) > orders.total_amount;
+```
+- A foreign key (order_id in payments) is NOT unique, multiple payments can reference one order
+- Two payment records for one order = either split payment or duplicate charge, check the amounts
+- Sum of payments > order total = overpayment, investigate immediately
+
+---
+
+## Operator Precedence in WHERE
+
+AND evaluates before OR, same as multiplication before addition in math:
+
+```sql
+-- This is ambiguous and likely wrong:
+WHERE status = 'completed' OR status = 'shipped' AND payment_id IS NULL OR payment_status = 'failed'
+
+-- SQL reads it as:
+WHERE status = 'completed'
+   OR (status = 'shipped' AND payment_id IS NULL)
+   OR payment_status = 'failed'
+
+-- What you probably meant (use brackets to be explicit):
+WHERE (status = 'completed' OR status = 'shipped')
+  AND (payment_id IS NULL OR payment_status = 'failed')
+```
+- Always use brackets when mixing AND and OR in the same WHERE clause
+- If a query returns unexpected results, check your AND/OR grouping first
+
 ---
 
 ## Style Rules
