@@ -198,6 +198,50 @@ HAVING SUM(payments.amount) > orders.total_amount;
 
 ---
 
+## Subqueries
+
+A subquery is a SELECT inside another SELECT. The inner query runs first, its result is used by the outer query. Three places subqueries can live:
+
+### 1. Subquery in WHERE with IN (list of values)
+Use when you need to filter based on a list produced by another query.
+```sql
+-- Find all customers who have at least one completed order
+SELECT *
+FROM customers
+WHERE customers.customer_id IN (
+    SELECT orders.customer_id
+    FROM orders
+    WHERE orders.order_status = 'completed'
+);
+```
+- Inner query runs first, returns a list of customer_ids
+- Outer query filters customers to only those in that list
+- Same result as a JOIN + GROUP BY, but sometimes clearer to read
+- Prefer JOIN for large datasets (better performance)
+
+### 2. Subquery in WHERE with single aggregate value
+Use when you need to compare against a dynamically computed value (average, max, min).
+```sql
+-- Find all orders above the average order amount
+SELECT customer_id, total_amount
+FROM orders
+WHERE total_amount > (
+    SELECT AVG(total_amount) FROM orders
+);
+```
+- Inner query computes one value (the average across all orders)
+- Outer query uses that value as a dynamic filter
+- Never hardcode the value, use the subquery so it recalculates if data changes
+- This is where subqueries genuinely outperform JOINs: JOINs cannot cleanly express "compare against a single aggregate of the whole table"
+
+### When to use subqueries vs JOINs
+- Prefer JOIN: when combining data from multiple tables for display, or when performance matters on large datasets
+- Prefer subquery: when comparing against a single aggregate value (AVG, MAX, MIN), or when the logic reads more clearly as a nested question
+- Avoid correlated subqueries (inner query references outer query per row) on large tables, they run once per row and are slow
+- Modern query optimizers often rewrite subqueries as JOINs internally anyway, so on small/medium datasets the difference is minimal
+
+---
+
 ## Operator Precedence in WHERE
 
 AND evaluates before OR, same as multiplication before addition in math:
