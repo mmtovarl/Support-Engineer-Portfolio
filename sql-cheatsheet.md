@@ -234,6 +234,22 @@ WHERE total_amount > (
 - Never hardcode the value, use the subquery so it recalculates if data changes
 - This is where subqueries genuinely outperform JOINs: JOINs cannot cleanly express "compare against a single aggregate of the whole table"
 
+### 3. Correlated Subquery
+Use when the inner query needs to reference the current row of the outer query. Runs once per row of the outer query.
+```sql
+-- Find products where standard price is higher than the lowest unit price ever charged
+SELECT * FROM products
+WHERE products.price > (
+    SELECT MIN(order_items.unit_price)
+    FROM order_items
+    WHERE order_items.product_id = products.product_id
+);
+```
+- Inner query references `products.product_id` from the outer query
+- Runs once per product row, making it slower on large tables
+- Must use an aggregate (MIN, MAX, AVG) if multiple rows could match, otherwise SQLite may run silently but return unreliable results (PostgreSQL/SQL Server would throw an error)
+- Usually replaceable with a JOIN, which is faster and clearer for this use case
+
 ### When to use subqueries vs JOINs
 - Prefer JOIN: when combining data from multiple tables for display, or when performance matters on large datasets
 - Prefer subquery: when comparing against a single aggregate value (AVG, MAX, MIN), or when the logic reads more clearly as a nested question
