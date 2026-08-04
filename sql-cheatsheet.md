@@ -287,3 +287,5 @@ WHERE (status = 'completed' OR status = 'shipped')
 - Keywords case-insensitive in SQL, but consistent casing improves readability
 - Aliases use snake_case: `sum_of_items`, not `Sum Of Items` or `'Sum of Items'`
 - One JOIN per line, aligned ON clauses for readability
+- Use `=` for exact matches (strings or numbers), `LIKE` only when using `%` or `_` wildcards for pattern matching. Never use `LIKE` without a wildcard, it works but is slower and communicates wrong intent
+- Table aliases are most useful when referencing the same table twice in one query (e.g. correlated subqueries), not just for saving keystrokes
