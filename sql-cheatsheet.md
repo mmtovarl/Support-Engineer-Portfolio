@@ -52,9 +52,12 @@ FROM bookings
 LEFT JOIN payments ON bookings.booking_id = payments.booking_id
 LEFT JOIN sync_log ON bookings.booking_id = sync_log.booking_id
 ```
-- Use LEFT JOIN when you need to find missing records (NULL on right side)
+- Use LEFT JOIN when you need to find missing records (NULL on right side), or when you genuinely expect some rows might not have a match and want to keep them anyway
+- Use INNER JOIN (or bare JOIN) when a match is expected to always exist
+- **`JOIN` and `INNER JOIN` are functionally identical** (INNER is the implicit default), but write `INNER JOIN` explicitly. It's a forcing function to consciously decide whether a match should always exist, rather than defaulting to LEFT JOIN out of habit because "it's worked so far." LEFT JOIN defaulting can mask real data integrity issues (orphaned rows with no valid foreign key) that are worth knowing about, not silently including
 - Never chain ON clauses: `ON table1.id = table2.id = table3.id` is invalid
 - Always use table.column notation in ON clauses for clarity
+- **Prefer `ON` over `USING`**, even when both tables share an identically-named column (e.g. `USING (user_id)`). `USING` merges the joined column into a single collapsed output column, losing the ability to reference `table.column` separately afterward, and it breaks the moment column names differ across tables, which happens constantly in real schemas
 
 **Watch out:** a LEFT JOIN followed by a WHERE condition on the right table's column silently behaves like an INNER JOIN. Unmatched rows get NULL on the right side, and any comparison against NULL (`=`, `!=`, `>`, `<`) evaluates to NULL, not TRUE, so WHERE drops those rows anyway. If a LEFT JOIN isn't preserving unmatched rows in practice, check whether a WHERE clause is silently filtering them back out.
 
@@ -86,6 +89,28 @@ FROM messages
 GROUP BY sender_id;
 ```
 
+**Composite GROUP BY (multiple columns) — mental model: composite buckets.** `GROUP BY col1, col2` creates one bucket per unique **combination** of both values, not sequential grouping. `GROUP BY country, device_type` creates a distinct bucket for every `(country, device_type)` pair, e.g. `(US, Mobile)`, `(US, Laptop)`, `(UK, Mobile)`, not "group by country, then subdivide by device."
+
+```sql
+SELECT country, device_type, COUNT(user_id) AS total_users, SUM(view_count) AS total_views
+FROM user_activity
+GROUP BY country, device_type
+ORDER BY country ASC, total_views DESC;
+```
+
+**GROUP BY + aliases, dialect note:** PostgreSQL allows referencing SELECT aliases in GROUP BY as a non-standard extension (e.g. `GROUP BY mth` where `mth` is a SELECT alias). This is **not universal**, MySQL/SQL Server support is inconsistent, and strict ANSI SQL doesn't guarantee it. Since queries may need to run on either MySQL or Postgres syntax depending on the target engine, the safer, portable habit is to repeat the full expression in GROUP BY rather than relying on the alias, even where the current dialect happens to allow it:
+```sql
+-- Fragile, Postgres-only
+SELECT EXTRACT(MONTH FROM submit_date) AS mth, product_id AS product, ROUND(AVG(stars), 2) AS avg_stars
+FROM reviews
+GROUP BY mth, product;
+
+-- Portable across dialects
+SELECT EXTRACT(MONTH FROM submit_date) AS mth, product_id AS product, ROUND(AVG(stars), 2) AS avg_stars
+FROM reviews
+GROUP BY EXTRACT(MONTH FROM submit_date), product_id;
+```
+
 ### ORDER BY
 ```sql
 ORDER BY column DESC                          -- single column
@@ -96,7 +121,7 @@ ORDER BY                                      -- deprioritize cancelled orders
   ABS(difference) DESC;
 ```
 - Goes at the very end of the query
-- Can reference SELECT aliases (unlike WHERE/HAVING)
+- Can reference SELECT aliases (unlike WHERE/HAVING), since ORDER BY runs after SELECT
 - Multiple conditions: comma-separated, evaluated left to right
 
 ---
@@ -117,12 +142,15 @@ Practical use: comment out a JOIN or WHERE condition to isolate whether it's cau
 
 ## Useful Functions
 
-### ROUND
+### ROUND vs TRUNCATE
 ```sql
-ROUND(SUM(order_items.line_total), 2)  -- round to 2 decimal places
+ROUND(x, 2)      -- rounds to the nearest value at 2 decimal places
+TRUNCATE(x, 2)   -- MySQL: chops off digits past 2 decimal places, no rounding
+TRUNC(x, 2)      -- Postgres equivalent of TRUNCATE
 ```
-- Standard SQL, works across SQLite, PostgreSQL, MySQL, SQL Server
-- Rounding in HAVING can mask small differences, consider checking raw values first
+- **ROUND**: standard across SQLite/Postgres/MySQL/SQL Server, rounds to the nearest value (round-half-up in most engines; some dialects/numeric types use round-half-to-even, "banker's rounding"). Use for standard reporting/financial metrics where the closest mathematical value is wanted, e.g. average star ratings, average prices. Rounding inside HAVING can mask small differences, check raw values first if a HAVING filter behaves unexpectedly.
+- **TRUNCATE / TRUNC**: chops off digits past the specified decimal place entirely, no rounding logic, always moves toward zero regardless of how large the trailing digits are. Use when business logic prohibits partial credit or progression, e.g. completed years of age, payout thresholds, tier limits that require a full threshold before advancing.
+- Don't default to ROUND when the question implies a floor/threshold semantic, and don't reach for TRUNCATE on something like an average rating where the closest value is actually wanted, that's ROUND's job.
 
 ### ABS
 ```sql
@@ -176,7 +204,7 @@ Date columns are numeric under the hood, which is why arithmetic works on them (
 - **PostgreSQL/ANSI**: `EXTRACT(YEAR FROM date_col)` / `EXTRACT(MONTH FROM date_col)`.
 - **SQLite**: `strftime('%Y', date_col)` / `strftime('%m', date_col)`.
 
-DataLemur questions can be solved in either MySQL or Postgres syntax depending on which dialect is selected for the question. Check which one before reaching for DATEDIFF/YEAR (MySQL) vs EXTRACT (Postgres).
+Check which SQL dialect is in use before reaching for DATEDIFF/YEAR (MySQL) vs EXTRACT (Postgres), since syntax varies by target engine.
 
 ### Dialect-agnostic range filter (preferred when possible)
 ```sql
@@ -308,7 +336,7 @@ Inner query references `products.product_id` from the outer query, running once 
 - Prefer JOIN: combining data from multiple tables for display, or when performance matters on large datasets
 - Prefer subquery: comparing against a single aggregate value (AVG, MAX, MIN), or when the logic reads more clearly as a nested question
 - Avoid correlated subqueries on large tables, they run once per row and are slow
-- **Avoid subqueries entirely when GROUP BY + aggregate answers the question** (see recurring mistake pattern below)
+- **Avoid subqueries entirely when GROUP BY + aggregate answers the question** (see recurring mistake patterns below)
 
 ---
 
@@ -394,6 +422,8 @@ FROM (
 ```
 GROUP BY the columns that define "duplicate", then HAVING COUNT(*) > 1. **Don't reach for a self-join here** — it's a common instinct but creates unnecessary row-multiplication and is easy to get wrong (see the LEFT JOIN + WHERE trap above). GROUP BY + HAVING COUNT(*) > 1 is simpler, faster, and directly matches the actual question ("does more than one of this combination exist").
 
+Note: this finds and counts duplicate *groups*, but collapses rows. If the actual need is to see the individual duplicate rows themselves, not just confirm duplicates exist, that needs a window function (`ROW_NUMBER() OVER (PARTITION BY <duplicate-defining columns>)`, then filter `WHERE rn > 1`) or a self-join back to the grouped result, since row-level detail is required there.
+
 ### Conditional breakdown by category
 ```sql
 SELECT
@@ -449,15 +479,19 @@ Not yet covered in depth — flagged as the next topic. GROUP BY collapses rows 
 
 ---
 
-## Recurring Mistake Pattern to Watch For
+## Recurring Mistake Patterns to Watch For
 
-Reaching for a subquery or self-join by default when the real need is GROUP BY + aggregate.
+**Reaching for a subquery or self-join by default when the real need is GROUP BY + aggregate.**
 
-**Test before writing the query:** am I comparing across genuinely separate/unrelated data (subquery), or do I just need a value computed within a group I already have (GROUP BY + aggregate, no subquery)?
+Test before writing the query: am I comparing across genuinely separate/unrelated data (subquery), or do I just need a value computed within a group I already have (GROUP BY + aggregate, no subquery)?
 
-**Deeper version of the test:** does the output need to stay at row-level granularity, or collapse to one row per group?
+Deeper version of the test: does the output need to stay at row-level granularity, or collapse to one row per group?
 - If row-level detail must be kept alongside a group-level or whole-table aggregate (e.g. each row vs its group's average), GROUP BY alone cannot do it — you need a subquery/CTE+JOIN or a window function, even when the comparison is within the "same column."
-- Finding duplicates specifically is almost always `GROUP BY + HAVING COUNT(*) > 1`, not a self-join.
+- Finding duplicates specifically is almost always `GROUP BY + HAVING COUNT(*) > 1`, not a self-join, but remember GROUP BY collapses rows, so it only confirms/counts duplicates, it doesn't show them at row level.
+
+**Defaulting to LEFT JOIN out of habit rather than deliberately choosing JOIN type.**
+
+"It's worked so far" isn't evidence the habit is safe, it just means the practice data hasn't exposed the gap yet. Ask which JOIN type reflects what's actually known or expected about the data before writing it.
 
 ---
 
@@ -492,3 +526,5 @@ WHERE (status = 'completed' OR status = 'shipped')
 - One JOIN per line, aligned ON clauses for readability
 - Use `=` for exact matches (strings or numbers), `LIKE` only when using `%` or `_` wildcards for pattern matching. Never use `LIKE` without a wildcard, it works but is slower and communicates wrong intent
 - Table aliases are most useful when referencing the same table twice in one query (e.g. correlated subqueries), not just for saving keystrokes
+- Always spell out `INNER JOIN` rather than bare `JOIN`, even though they're identical, as a forcing function for deliberate JOIN-type choice
+- Prefer `ON` over `USING` for JOINs, even when column names match exactly
