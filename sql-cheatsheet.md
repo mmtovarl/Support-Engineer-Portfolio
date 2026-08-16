@@ -22,6 +22,7 @@ FROM table;
 - `*` returns all columns (avoid in production queries, be explicit)
 - No way to exclude specific columns in standard SQL (no `SELECT * EXCEPT`)
 - Aliases are for display and ORDER BY only, not for WHERE/HAVING
+- Always alias aggregate outputs explicitly (e.g. `SUM(amount) AS deposit_total`), never rely on the engine's implicit default column name (e.g. bare `sum`); it's ambiguous and dialect-dependent
 
 ### WHERE
 ```sql
@@ -47,6 +48,10 @@ INNER JOIN payments ON orders.order_id = payments.order_id
 FROM orders
 LEFT JOIN payments ON orders.order_id = payments.order_id
 
+-- FULL OUTER JOIN: all rows from BOTH tables, NULLs on whichever side has no match
+FROM deposits
+FULL OUTER JOIN withdrawals ON deposits.account_id = withdrawals.account_id
+
 -- Multiple JOINs: each gets its own ON clause
 FROM bookings
 LEFT JOIN payments ON bookings.booking_id = payments.booking_id
@@ -54,12 +59,27 @@ LEFT JOIN sync_log ON bookings.booking_id = sync_log.booking_id
 ```
 - Use LEFT JOIN when you need to find missing records (NULL on right side), or when you genuinely expect some rows might not have a match and want to keep them anyway
 - Use INNER JOIN (or bare JOIN) when a match is expected to always exist
+- Use FULL OUTER JOIN when combining two independently-aggregated result sets (e.g. two CTEs, one per category) and every entity from either side must appear in the output, even if it only has data on one side
 - **`JOIN` and `INNER JOIN` are functionally identical** (INNER is the implicit default), but write `INNER JOIN` explicitly. It's a forcing function to consciously decide whether a match should always exist, rather than defaulting to LEFT JOIN out of habit because "it's worked so far." LEFT JOIN defaulting can mask real data integrity issues (orphaned rows with no valid foreign key) that are worth knowing about, not silently including
+- **INNER JOIN between two separately-aggregated CTEs silently drops rows that exist in only one CTE** (e.g. an account with deposits but no withdrawals never appears in the result). If every entity must appear regardless of which side has data, use FULL OUTER JOIN + COALESCE, or better, check whether a single-pass GROUP BY + CASE avoids the join entirely (see conditional running balance pattern below)
 - Never chain ON clauses: `ON table1.id = table2.id = table3.id` is invalid
 - Always use table.column notation in ON clauses for clarity
 - **Prefer `ON` over `USING`**, even when both tables share an identically-named column (e.g. `USING (user_id)`). `USING` merges the joined column into a single collapsed output column, losing the ability to reference `table.column` separately afterward, and it breaks the moment column names differ across tables, which happens constantly in real schemas
 
 **Watch out:** a LEFT JOIN followed by a WHERE condition on the right table's column silently behaves like an INNER JOIN. Unmatched rows get NULL on the right side, and any comparison against NULL (`=`, `!=`, `>`, `<`) evaluates to NULL, not TRUE, so WHERE drops those rows anyway. If a LEFT JOIN isn't preserving unmatched rows in practice, check whether a WHERE clause is silently filtering them back out.
+
+### Self-Joins
+Alias **both** sides symmetrically with role-based names (e.g. `emp`/`mgr`), never leave one side as the bare table name. A bare table name on one side of a self-join is legal but makes it easy to lose track of which alias represents which role, especially mid-debugging.
+
+```sql
+-- Compare employees against their managers
+SELECT emp.employee_id, emp.name
+FROM employee AS emp
+LEFT JOIN employee AS mgr ON emp.manager_id = mgr.employee_id
+WHERE emp.salary > mgr.salary;
+```
+
+Symmetric role-based aliasing makes the comparison direction visually obvious at every line and reduces risk of accidentally swapping the comparison (e.g. writing `mgr.salary > emp.salary` by mistake).
 
 ### GROUP BY + HAVING
 ```sql
@@ -178,11 +198,64 @@ FROM viewership;
 - One pass over the table counts multiple buckets at once, instead of separate filtered queries per condition
 - Combine with GROUP BY to get the same breakdown per group (e.g. per date)
 
+### Conditional Running Balance (signed SUM+CASE)
+Instead of flagging 1/0, flag with the signed value itself to compute a net balance in one pass, no join needed:
+```sql
+SELECT account_id,
+    SUM(CASE 
+        WHEN transaction_type = 'Deposit' THEN amount
+        WHEN transaction_type = 'Withdrawal' THEN -amount
+        ELSE 0
+    END) AS final_balance
+FROM transactions
+GROUP BY account_id;
+```
+Beats splitting into two CTEs (one per category) and JOINing them: single table scan instead of multiple, and GROUP BY naturally includes every entity with ANY matching row, avoiding the INNER-JOIN-drops-rows bug entirely (no join to have the bug in). Always include an explicit `ELSE` (e.g. `ELSE 0`) rather than relying on `ELSE -amount` to catch "everything else" — if a third category could exist in the data, that silently miscounts unexpected values instead of ignoring them. Use `SELECT DISTINCT` on the category column first if unsure how many categories actually exist.
+
 ### COUNT(*) vs COUNT(column)
 - `COUNT(*)` counts all rows, regardless of NULLs
 - `COUNT(column)` counts only non-NULL values in that column
 - Only identical if the column can never be NULL
 - Default to `COUNT(*)` unless specifically counting non-null occurrences of one column; `COUNT(column)` silently undercounts if that column can contain NULLs
+
+### COUNT(CASE...) vs SUM(CASE...) — a silent trap
+If the CASE has an `ELSE` that returns a real value (e.g. `ELSE 0`), **every** row produces a non-NULL result regardless of whether the condition matched. So:
+```sql
+-- WRONG: silently returns the TOTAL ROW COUNT, not the count of matches
+COUNT(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END)
+```
+No error, just a wrong number, since COUNT counts non-NULLs and both branches of the CASE are non-NULL.
+
+Two correct patterns:
+```sql
+-- (1) SUM the flags — correct WITH an ELSE present
+SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END)
+
+-- (2) COUNT with no ELSE — non-matches implicitly return NULL, COUNT skips them
+COUNT(CASE WHEN event_type = 'click' THEN 1 END)
+```
+**Rule:** CASE with an ELSE returning a value → use SUM. CASE with no ELSE (implicit NULL fallthrough) → COUNT works. Never mix the two (COUNT with an ELSE that returns 0).
+
+### Integer Division Truncation
+Dividing an integer by an integer truncates to an integer in most dialects (`3 / 7` = `0`, not `0.428...`). `SUM(CASE WHEN...THEN 1 ELSE 0 END)` produces an integer, so dividing two such SUMs truncates silently, no error:
+```sql
+-- Truncates silently if both SUMs are integers
+100 * SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END)
+    / SUM(CASE WHEN event_type = 'impression' THEN 1 ELSE 0 END)
+```
+Fix by promoting to numeric/decimal **before** the division completes, via any one of:
+```sql
+-- (1) Decimal literal outside — the .0 promotes the whole expression
+100.0 * SUM(...) / SUM(...)
+
+-- (2) Decimal literal inside the CASE — makes the SUM itself numeric
+SUM(CASE WHEN event_type = 'click' THEN 1.0 ELSE 0 END) / SUM(...)
+
+-- (3) Explicit cast at the division point
+SUM(...)::NUMERIC / SUM(...)                    -- Postgres shorthand
+CAST(SUM(...) AS NUMERIC) / SUM(...)             -- standard
+```
+Only **one** coercion point is needed; stacking multiple isn't wrong but signals uncertainty about which fix is actually load-bearing. Casting at the division point is more self-documenting for a reader who hasn't hit this bug before, since the fix sits visually next to the actual risk. Don't assume a reader will recognize a bare `1.0` literal as a truncation fix without already knowing this specific gotcha — write for the reader who hasn't hit it yet, not just for someone with identical background.
 
 ---
 
@@ -204,7 +277,7 @@ Date columns are numeric under the hood, which is why arithmetic works on them (
 - **PostgreSQL/ANSI**: `EXTRACT(YEAR FROM date_col)` / `EXTRACT(MONTH FROM date_col)`.
 - **SQLite**: `strftime('%Y', date_col)` / `strftime('%m', date_col)`.
 
-Check which SQL dialect is in use before reaching for DATEDIFF/YEAR (MySQL) vs EXTRACT (Postgres), since syntax varies by target engine.
+Check which SQL dialect is in use before reaching for `DATEDIFF`/`YEAR` (MySQL) vs `EXTRACT` (Postgres), since syntax varies by target engine.
 
 ### Dialect-agnostic range filter (preferred when possible)
 ```sql
@@ -235,6 +308,13 @@ WHERE payments.payment_id != NULL
 - Any comparison against NULL (=, !=, >, <) returns NULL, not TRUE/FALSE
 - WHERE only includes rows where the condition is TRUE, so NULL comparisons silently exclude rows
 - LEFT JOIN + IS NULL is the standard pattern for finding missing related records
+
+### COALESCE(value, fallback)
+Returns the first non-NULL argument in the list:
+```sql
+COALESCE(deposit.deposit_total, 0) - COALESCE(withdrawal.withdrawal_total, 0)
+```
+Use to substitute a default when a value could be NULL from a join's unmatched side (e.g. after a FULL OUTER JOIN). Without it, `NULL - 5` or `5 - NULL` evaluates to NULL for the whole expression, silently losing an otherwise fully-knowable row.
 
 ---
 
@@ -288,6 +368,7 @@ SELECT * FROM step2;
 ```
 - Defined once, can be referenced multiple times in the outer query, unlike a subquery which must be retyped each time
 - Best for multi-step investigations (raw data -> flag anomalies -> aggregate), since each step gets a readable name instead of nested parentheses
+- Watch out: chaining two CTEs and then INNER JOINing them (e.g. one CTE per category) silently drops entities that only appear in one CTE. Check whether a single-pass GROUP BY + CASE avoids this risk entirely before reaching for the two-CTE-plus-JOIN pattern
 
 ---
 
@@ -420,9 +501,31 @@ FROM (
     HAVING COUNT(*) > 1
 ) duplicated_listings;
 ```
-GROUP BY the columns that define "duplicate", then HAVING COUNT(*) > 1. **Don't reach for a self-join here** — it's a common instinct but creates unnecessary row-multiplication and is easy to get wrong (see the LEFT JOIN + WHERE trap above). GROUP BY + HAVING COUNT(*) > 1 is simpler, faster, and directly matches the actual question ("does more than one of this combination exist").
+GROUP BY the columns that define "duplicate", then HAVING COUNT(*) > 1. **Don't reach for a self-join here** — it creates unnecessary row-multiplication and is easy to get wrong. GROUP BY + HAVING COUNT(*) > 1 is simpler, faster, and directly matches the actual question ("does more than one of this combination exist").
 
 Note: this finds and counts duplicate *groups*, but collapses rows. If the actual need is to see the individual duplicate rows themselves, not just confirm duplicates exist, that needs a window function (`ROW_NUMBER() OVER (PARTITION BY <duplicate-defining columns>)`, then filter `WHERE rn > 1`) or a self-join back to the grouped result, since row-level detail is required there.
+
+### Compare rows within the same table by role
+```sql
+SELECT emp.employee_id, emp.name
+FROM employee AS emp
+LEFT JOIN employee AS mgr ON emp.manager_id = mgr.employee_id
+WHERE emp.salary > mgr.salary;
+```
+Self-join with symmetric role-based aliases (see Self-Joins section above). Join condition maps one role's foreign key to the other role's primary key, then filter/compare across the two aliases in WHERE.
+
+### Net balance across categories
+```sql
+SELECT account_id,
+    SUM(CASE 
+        WHEN transaction_type = 'Deposit' THEN amount
+        WHEN transaction_type = 'Withdrawal' THEN -amount
+        ELSE 0
+    END) AS final_balance
+FROM transactions
+GROUP BY account_id;
+```
+Signed SUM+CASE in a single GROUP BY pass (see Conditional Running Balance above). Avoid the two-CTE-plus-JOIN approach, it risks silently dropping entities that only have one category of row.
 
 ### Conditional breakdown by category
 ```sql
@@ -433,6 +536,19 @@ SELECT
 FROM viewership
 GROUP BY date;
 ```
+
+### Rate/ratio between two conditional counts
+```sql
+SELECT app_id,
+    ROUND(
+        100.0 * SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END)
+              / SUM(CASE WHEN event_type = 'impression' THEN 1 ELSE 0 END)
+    , 2) AS ctr
+FROM events
+WHERE event_date >= '2022-01-01' AND event_date < '2023-01-01'
+GROUP BY app_id;
+```
+E.g. click-through rate = clicks/impressions. `SUM(CASE WHEN...)` for numerator and denominator separately, watch for integer division truncation (see Integer Division Truncation above), only one coercion point needed to fix it.
 
 ### Gap between first/last event per group
 ```sql
@@ -481,17 +597,26 @@ Not yet covered in depth — flagged as the next topic. GROUP BY collapses rows 
 
 ## Recurring Mistake Patterns to Watch For
 
-**Reaching for a subquery or self-join by default when the real need is GROUP BY + aggregate.**
+**Reaching for a subquery, self-join, or multi-CTE-plus-JOIN by default when the real need is a single-pass GROUP BY + aggregate (possibly with CASE).**
 
-Test before writing the query: am I comparing across genuinely separate/unrelated data (subquery), or do I just need a value computed within a group I already have (GROUP BY + aggregate, no subquery)?
+Test before writing the query: am I comparing across genuinely separate/unrelated data, or do I just need a value computed within a group I already have?
 
-Deeper version of the test: does the output need to stay at row-level granularity, or collapse to one row per group?
-- If row-level detail must be kept alongside a group-level or whole-table aggregate (e.g. each row vs its group's average), GROUP BY alone cannot do it — you need a subquery/CTE+JOIN or a window function, even when the comparison is within the "same column."
+Deeper test: does the output need to stay at row-level granularity, or collapse to one row per group?
+- If row-level detail must be kept alongside a group-level or whole-table aggregate, GROUP BY alone cannot do it — need a subquery/CTE+JOIN or a window function.
 - Finding duplicates specifically is almost always `GROUP BY + HAVING COUNT(*) > 1`, not a self-join, but remember GROUP BY collapses rows, so it only confirms/counts duplicates, it doesn't show them at row level.
+- Splitting a category comparison into separate CTEs per category then INNER JOINing them is a common instinct but risks dropping entities that only appear in one category; check whether a single-pass signed SUM+CASE answers the question instead.
 
 **Defaulting to LEFT JOIN out of habit rather than deliberately choosing JOIN type.**
 
 "It's worked so far" isn't evidence the habit is safe, it just means the practice data hasn't exposed the gap yet. Ask which JOIN type reflects what's actually known or expected about the data before writing it.
+
+**Using COUNT(CASE...) with an ELSE clause when SUM(CASE...) is needed.** See the COUNT vs SUM trap above.
+
+**Forgetting integer division truncates and needs an explicit numeric coercion.** See Integer Division Truncation above.
+
+**Assuming a reader will infer a fix's purpose without it being visually near the actual risk point** (e.g. a bare `1.0` literal placed far from the division it's fixing). Write for the reader who hasn't hit the specific gotcha yet, not just for someone with identical background/experience.
+
+**Before asking outside for syntax help, check this cheat sheet first.** Several lookups have turned out to already be answered here.
 
 ---
 
@@ -525,6 +650,9 @@ WHERE (status = 'completed' OR status = 'shipped')
 - Aliases use snake_case: `sum_of_items`, not `Sum Of Items` or `'Sum of Items'`
 - One JOIN per line, aligned ON clauses for readability
 - Use `=` for exact matches (strings or numbers), `LIKE` only when using `%` or `_` wildcards for pattern matching. Never use `LIKE` without a wildcard, it works but is slower and communicates wrong intent
-- Table aliases are most useful when referencing the same table twice in one query (e.g. correlated subqueries), not just for saving keystrokes
+- Table aliases are most useful when referencing the same table twice in one query (e.g. correlated subqueries, self-joins), not just for saving keystrokes
 - Always spell out `INNER JOIN` rather than bare `JOIN`, even though they're identical, as a forcing function for deliberate JOIN-type choice
 - Prefer `ON` over `USING` for JOINs, even when column names match exactly
+- ALWAYS alias BOTH sides of a self-join symmetrically with role-based names, never leave one side unaliased
+- Always explicitly alias aggregate function outputs, never rely on implicit default naming
+- Write for the reader who hasn't already internalized your reasoning, not just for someone with identical background/experience
