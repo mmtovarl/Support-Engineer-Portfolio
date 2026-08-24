@@ -3,12 +3,13 @@
 ## Query Execution Order
 SQL does NOT execute top-to-bottom like JavaScript. Actual order:
 ```
-FROM → JOIN → WHERE → GROUP BY → (aggregates computed) → HAVING → SELECT → ORDER BY → LIMIT
+FROM → JOIN → WHERE → GROUP BY → (aggregates computed) → HAVING → SELECT (window functions computed here) → ORDER BY → LIMIT
 ```
 This explains why:
 - Aliases defined in SELECT cannot be used in WHERE or HAVING
 - Aggregate functions (COUNT, SUM) cannot be used in WHERE
 - ORDER BY can reference aliases (it runs after SELECT)
+- Window function results (ROW_NUMBER, RANK, LAG, etc) can't be filtered in the same query's WHERE or HAVING, since those clauses run before window functions are computed. Always wrap in a subquery/CTE and filter in the outer layer.
 
 ---
 
@@ -108,7 +109,7 @@ ORDER BY COUNT(action_type) DESC;
 
 **The full-GROUP-BY rule:** every column in SELECT must be either inside an aggregate function or listed in GROUP BY. No third option (a fixed literal also qualifies, since it's the same value across every row in the group). PostgreSQL and MySQL 5.7+ (`ONLY_FULL_GROUP_BY` default) both reject queries that violate this. Older MySQL used to silently pick an arbitrary row's value instead, which is dangerous since the result looks valid but is meaningless.
 
-This is a **per-column rule, not a column-count limit**. Any number of columns are fine as long as each one individually is either the GROUP BY column or wrapped in an aggregate:
+This is a **per-column rule, not a column-count limit, and not "first column plain, rest aggregate."** It's per-column and order-independent: any number of columns are fine as long as each one individually is either the GROUP BY column or wrapped in an aggregate:
 ```sql
 -- All fine, six columns after the GROUP BY column, all aggregated
 SELECT sender_id,
@@ -120,6 +121,24 @@ SELECT sender_id,
 FROM messages
 GROUP BY sender_id;
 ```
+
+**GROUP BY silent group-fragmentation trap.** If a query fails full-GROUP-BY validation because a raw per-row expression (e.g. `cogs - total_sales`) is unaggregated in SELECT, adding that same expression to GROUP BY makes the query **valid syntax but usually wrong semantics**:
+```sql
+-- WRONG despite running without error: fragments groups, doesn't fix the real issue
+SELECT manufacturer, COUNT(drug) AS drug_count, cogs - total_sales AS total_loss
+FROM pharmacy_sales
+WHERE cogs - total_sales > 0
+GROUP BY manufacturer, total_loss   -- adding the raw expression here is the trap
+ORDER BY total_loss DESC;
+
+-- CORRECT: aggregate the expression itself instead of grouping by it
+SELECT manufacturer, COUNT(drug) AS drug_count, SUM(cogs - total_sales) AS total_loss
+FROM pharmacy_sales
+WHERE cogs - total_sales > 0
+GROUP BY manufacturer
+ORDER BY total_loss DESC;
+```
+If the raw expression is near-unique per row, `GROUP BY manufacturer, total_loss` doesn't give one row per manufacturer, it gives close to one row per manufacturer-per-item, since each item's raw value differs. Any aggregate alongside it (like `COUNT`) then computes over these tiny fragmented buckets, coming out as mostly 1s, instead of the real per-manufacturer number. No error is thrown, the query just silently answers a different, wrong question. **This is more dangerous than the hard-rejection version of the rule**, since nothing signals the mistake except manually checking whether the output actually makes sense. The correct fix is always to aggregate the expression (`SUM`, `COUNT`, etc), never to add it to GROUP BY as a workaround.
 
 **Composite GROUP BY (multiple columns) — mental model: composite buckets.** `GROUP BY col1, col2` creates one bucket per unique **combination** of both values, not sequential grouping. `GROUP BY country, device_type` creates a distinct bucket for every `(country, device_type)` pair, e.g. `(US, Mobile)`, `(US, Laptop)`, `(UK, Mobile)`, not "group by country, then subdivide by device."
 
@@ -173,6 +192,74 @@ ORDER BY                                      -- deprioritize cancelled orders
 - Can reference SELECT aliases (unlike WHERE/HAVING), since ORDER BY runs after SELECT
 - Multiple conditions: comma-separated, evaluated left to right
 - Use it as a standing habit even when not strictly required by a question, to keep the syntax and clause ordering from becoming a lookup-every-time item
+
+---
+
+## Window Functions
+
+**Mental model:** every aggregate function (`SUM`, `COUNT`, `AVG`, `MAX`, `MIN`) collapses rows down into one summary row per group, that's what GROUP BY does. Window functions borrow the same "bucket" idea, `PARTITION BY` instead of `GROUP BY`, but **never collapse anything**. Every row survives, and each row gets a computed value describing its relationship to its partition (its position within it, its rank, a neighboring row's value, a running total, etc).
+
+Use a window function whenever row-level detail must be preserved *and* something needs to be computed relative to a group that row belongs to, exactly the situations GROUP BY structurally can't handle.
+
+### Syntax anatomy
+```sql
+function_name() OVER (PARTITION BY grouping_column ORDER BY sort_column)
+```
+- **`PARTITION BY`**: which rows belong together (optional; omitted = the whole table is one partition)
+- **`ORDER BY`** (inside `OVER`): the order rows are considered in *within* their partition. Only matters for functions that care about sequence (ranking, previous/next row, running totals)
+- Window functions are computed in the SELECT phase, after WHERE/GROUP BY/HAVING have already run (see Execution Order above). This means their results **cannot be filtered in the same query's WHERE or HAVING**, since those clauses execute before the window function's output exists. Always wrap the windowed query in a subquery or CTE and filter in the outer layer.
+
+### ROW_NUMBER, RANK, DENSE_RANK — the ranking family
+```sql
+ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY spend DESC)
+RANK()       OVER (PARTITION BY user_id ORDER BY spend DESC)
+DENSE_RANK() OVER (PARTITION BY user_id ORDER BY spend DESC)
+```
+The difference is entirely about how they treat ties. Given spend values `100, 90, 90, 80`:
+
+| spend | ROW_NUMBER | RANK | DENSE_RANK |
+|---|---|---|---|
+| 100 | 1 | 1 | 1 |
+| 90 | 2 | 2 | 2 |
+| 90 | 3 | 2 | 2 |
+| 80 | 4 | 4 | 3 |
+
+- **`ROW_NUMBER`**: always unique (1, 2, 3, 4), ties broken arbitrarily by whichever row the engine processes first. Use when exactly one row per rank position is required, e.g. "the Nth transaction" — ties or not, you need a single row.
+- **`RANK`**: ties share a rank, but the next rank skips ahead (2, 2, then 4). Mirrors a race: two tied for 2nd, nobody gets 3rd.
+- **`DENSE_RANK`**: ties share a rank, no skipping (2, 2, 3).
+
+This is the actual fix for the "Top N per group" ties problem flagged elsewhere in this sheet: `ORDER BY ... LIMIT N` arbitrarily picks one of the tied rows with no guaranteed stability. `RANK`/`DENSE_RANK` make the tie explicit in the output instead of hiding it.
+
+### Finding the Nth row per group
+```sql
+SELECT user_id, spend, transaction_date
+FROM (
+    SELECT user_id, spend, transaction_date,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY transaction_date ASC) AS rn
+    FROM transactions
+) numbered_transactions
+WHERE rn = 3;
+```
+Numbers every user's transactions in date order without collapsing any rows; the outer query then filters to `rn = 3`, which by construction is each user's third transaction. Users with fewer than 3 transactions never produce an `rn = 3` row, so they're automatically excluded, no separate `HAVING COUNT >= 3` check needed, the filtering falls out of the numbering itself.
+
+### LAG and LEAD — looking at neighboring rows
+```sql
+LAG(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS previous_spend
+LEAD(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS next_spend
+```
+`LAG` pulls the value from the previous row in the ordered partition; `LEAD` pulls it from the next row. The first row's `LAG` (and the last row's `LEAD`) has nothing to reference and returns NULL, unless a default is supplied as a second argument.
+
+This is the standard tool for "how did this compare to last time" questions, e.g. spend change transaction-to-transaction. It's a genuinely different comparison from the row-vs-group-average CTE pattern below: that pattern measures distance from a *fixed group baseline*, `LAG`/`LEAD` measure distance from the *adjacent row specifically*, which is awkward to express without a window function at all.
+
+### Aggregates as window functions (running totals, group totals without collapsing)
+```sql
+-- Running cumulative sum per user (order matters for "running")
+SUM(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS running_total
+
+-- Full per-user total repeated on every row (no ORDER BY inside OVER)
+SUM(spend) OVER (PARTITION BY user_id) AS user_total_spend
+```
+The same aggregate functions already covered can run in "window mode." With `ORDER BY` inside `OVER`, the aggregate becomes cumulative (a running total). Without it, the aggregate computes once per partition and repeats that value on every row in the partition, useful for showing each row alongside a group total without needing the CTE+JOIN pattern from Row-Level Value vs Per-Group Baseline below, this does it in one pass.
 
 ---
 
@@ -446,7 +533,7 @@ SELECT * FROM step2;
 ```
 - Defined once, can be referenced multiple times in the outer query, unlike a subquery which must be retyped each time
 - Best for multi-step investigations (raw data -> flag anomalies -> aggregate), since each step gets a readable name instead of nested parentheses
-- Also the standard way to build two-level aggregation (the histogram pattern): first CTE computes the per-entity number, outer query groups by that number
+- Also the standard way to build two-level aggregation (the histogram pattern), or to isolate a window function so its result can be filtered (see Window Functions above)
 - Watch out: chaining two CTEs and then INNER JOINing them (e.g. one CTE per category) silently drops entities that only appear in one CTE. Check whether a single-pass GROUP BY + CASE avoids this risk entirely before reaching for the two-CTE-plus-JOIN pattern
 
 ---
@@ -606,6 +693,16 @@ GROUP BY account_id;
 ```
 Signed SUM+CASE in a single GROUP BY pass (see Conditional Running Balance above). Avoid the two-CTE-plus-JOIN approach, it risks silently dropping entities that only have one category of row.
 
+### Sum a raw per-row expression per group
+```sql
+SELECT manufacturer, COUNT(drug) AS drug_count, SUM(cogs - total_sales) AS total_loss
+FROM pharmacy_sales
+WHERE cogs - total_sales > 0
+GROUP BY manufacturer
+ORDER BY total_loss DESC;
+```
+E.g. total loss per manufacturer where loss = cogs - total_sales per drug. Filter rows first if needed, then SUM the raw expression grouped by the entity, alongside COUNT for a per-group count. **Do not add the raw expression itself to GROUP BY** to satisfy the full-GROUP-BY rule, that silently fragments groups (see GROUP BY silent group-fragmentation trap above).
+
 ### Conditional breakdown by category
 ```sql
 SELECT
@@ -665,14 +762,26 @@ SELECT sessions.user_id,
 FROM sessions
 LEFT JOIN average ON sessions.user_id = average.user_id;
 ```
-Example: each login's distance from that user's average login date. Needed whenever the output must stay at row-level granularity while comparing against a group-level aggregate — GROUP BY alone collapses rows and can't do this, so use a CTE/subquery to compute the per-group baseline, then JOIN back to the row-level table.
+Example: each login's distance from that user's average login date. Needed whenever the output must stay at row-level granularity while comparing against a group-level aggregate — GROUP BY alone collapses rows and can't do this, so use a CTE/subquery to compute the per-group baseline, then JOIN back to the row-level table. (A windowed aggregate, e.g. `AVG(...) OVER (PARTITION BY user_id)`, can also solve this shape in one pass, see Window Functions above.)
 
 **Verification trick:** deviations from an average should sum to approximately 0 (mathematical property of the mean). Sum the deviation column per group as a sanity check on the average calculation; small non-zero sums (e.g. off by 1) are expected rounding/truncation error, not a bug.
 
 ### Distribution/histogram of a per-entity count
 See Two-Level Aggregation under GROUP BY above. Not a special SQL feature, just GROUP BY twice, once to build the per-entity number (typically in a CTE), once to group by that number.
 
-### Top N per group ranking
+### Nth row per group, or first/last row per group with full row data
+```sql
+SELECT user_id, spend, transaction_date
+FROM (
+    SELECT user_id, spend, transaction_date,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY transaction_date ASC) AS rn
+    FROM transactions
+) numbered_transactions
+WHERE rn = 3;
+```
+GROUP BY collapses rows and loses access to other columns, so this needs a window function: `ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY date_col ASC/DESC)`, then filter on `rn` in an outer query. See Window Functions above.
+
+### Top N per group ranking, with ties
 ```sql
 SELECT sender_id, COUNT(*) AS message_count
 FROM messages
@@ -680,10 +789,7 @@ GROUP BY sender_id
 ORDER BY message_count DESC
 LIMIT 2;
 ```
-`ORDER BY ... LIMIT N` only works safely if no ties are expected in the data. If ties are possible and must be handled correctly, use `RANK()` (a window function) instead — `LIMIT` arbitrarily picks one of the tied rows with no guaranteed stability.
-
-### First/last row per group with full row data
-Not yet covered in depth — flagged as the next topic. GROUP BY collapses rows and loses access to other columns, so this needs a window function: `ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY date_col ASC/DESC)`.
+`ORDER BY ... LIMIT N` only works safely if no ties are expected in the data. If ties are possible and must be handled correctly, use `RANK()` or `DENSE_RANK()` instead (see Window Functions above) — `LIMIT` arbitrarily picks one of the tied rows with no guaranteed stability, while `RANK`/`DENSE_RANK` make the tie explicit in the output.
 
 ---
 
@@ -699,6 +805,8 @@ Deeper test: does the output need to stay at row-level granularity, or collapse 
 - A distribution/histogram question is two-level GROUP BY, not a special feature. Don't be thrown by unfamiliar terminology, translate it into "what per-entity number, then group by that number."
 - Splitting a category comparison into separate CTEs per category then INNER JOINing them is a common instinct but risks dropping entities that only appear in one category; check whether a single-pass signed SUM+CASE answers the question instead.
 
+**When a full-GROUP-BY error appears because a raw expression is unaggregated in SELECT**, the fix is to aggregate that expression (SUM/COUNT/etc), **not** to add it to GROUP BY. Adding it "fixes" the syntax error but silently fragments groups into near-row-level buckets and produces a wrong-but-valid result with no error to flag it. This is a worse failure mode than the original error, since nothing signals it except manually checking the output.
+
 **Defaulting to LEFT JOIN out of habit rather than deliberately choosing JOIN type.**
 
 "It's worked so far" isn't evidence the habit is safe, it just means the practice data hasn't exposed the gap yet. Ask which JOIN type reflects what's actually known or expected about the data before writing it.
@@ -712,6 +820,8 @@ Deeper test: does the output need to stay at row-level granularity, or collapse 
 **Casting only at the final operation instead of at the earliest point precision/range could matter.** See Cast Timing above.
 
 **Using EXTRACT(DAY) subtraction instead of DATEDIFF/date subtraction for elapsed-time math.** See the trap above.
+
+**Trying to filter a window function's result (ROW_NUMBER, RANK, etc) directly in WHERE or HAVING in the same query.** Window functions compute after those clauses run; always wrap in a subquery/CTE and filter in the outer layer.
 
 **Assuming a reader will infer a fix's purpose without it being visually near the actual risk point** (e.g. a bare `1.0` literal placed far from the division it's fixing). Write for the reader who hasn't hit the specific gotcha yet, not just for someone with identical background/experience.
 
@@ -756,4 +866,5 @@ WHERE (status = 'completed' OR status = 'shipped')
 - Always explicitly alias aggregate function outputs, never rely on implicit default naming
 - Cast to numeric/decimal at the earliest point in an expression where precision or range could matter, not just wherever the current symptom surfaces
 - Use ORDER BY as a standing habit even when not strictly required, to keep it from becoming a lookup-every-time item
+- When a raw per-row expression triggers a full-GROUP-BY error, aggregate the expression, never add it to GROUP BY as a workaround
 - Write for the reader who hasn't already internalized your reasoning, not just for someone with identical background/experience
