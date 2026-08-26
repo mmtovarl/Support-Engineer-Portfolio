@@ -10,6 +10,7 @@ This explains why:
 - Aggregate functions (COUNT, SUM) cannot be used in WHERE
 - ORDER BY can reference aliases (it runs after SELECT)
 - Window function results (ROW_NUMBER, RANK, LAG, etc) can't be filtered in the same query's WHERE or HAVING, since those clauses run before window functions are computed. Always wrap in a subquery/CTE and filter in the outer layer.
+- **GROUP BY + aggregates and window functions CAN combine in a single query, no CTE required for this reason alone.** Window functions run in the SELECT phase, after GROUP BY has already collapsed rows and resolved aggregates. So `ROW_NUMBER() OVER (... ORDER BY SUM(spend) DESC)` alongside `GROUP BY category, product` in the same SELECT is valid: by the time the window function runs, `SUM(spend)` is already a finished per-group value, not a raw per-row one. A CTE is often still clearer to read (one step per layer), but it isn't functionally required just to sequence aggregation before windowing.
 
 ---
 
@@ -208,6 +209,7 @@ function_name() OVER (PARTITION BY grouping_column ORDER BY sort_column)
 - **`PARTITION BY`**: which rows belong together (optional; omitted = the whole table is one partition)
 - **`ORDER BY`** (inside `OVER`): the order rows are considered in *within* their partition. Only matters for functions that care about sequence (ranking, previous/next row, running totals)
 - Window functions are computed in the SELECT phase, after WHERE/GROUP BY/HAVING have already run (see Execution Order above). This means their results **cannot be filtered in the same query's WHERE or HAVING**, since those clauses execute before the window function's output exists. Always wrap the windowed query in a subquery or CTE and filter in the outer layer.
+- **Combines freely with GROUP BY in the same query, no CTE required just for sequencing.** Since window functions run after GROUP BY/aggregates are resolved, an aggregate expression can be referenced directly inside a window function's `OVER (...)` in the same SELECT, e.g. `ROW_NUMBER() OVER (PARTITION BY category ORDER BY SUM(spend) DESC)` alongside `GROUP BY category, product`. A CTE is still often clearer for readability, but it isn't functionally necessary purely to pre-aggregate before windowing.
 
 ### ROW_NUMBER, RANK, DENSE_RANK — the ranking family
 ```sql
@@ -224,9 +226,9 @@ The difference is entirely about how they treat ties. Given spend values `100, 9
 | 90 | 3 | 2 | 2 |
 | 80 | 4 | 4 | 3 |
 
-- **`ROW_NUMBER`**: always unique (1, 2, 3, 4), ties broken arbitrarily by whichever row the engine processes first. Use when exactly one row per rank position is required, e.g. "the Nth transaction" — ties or not, you need a single row.
-- **`RANK`**: ties share a rank, but the next rank skips ahead (2, 2, then 4). Mirrors a race: two tied for 2nd, nobody gets 3rd.
-- **`DENSE_RANK`**: ties share a rank, no skipping (2, 2, 3).
+- **`ROW_NUMBER`**: always unique (1, 2, 3, 4), ties broken arbitrarily by whichever row the engine processes first. Use when exactly one row per rank position is required, e.g. "the Nth row" — ties or not, you need a single row. Breaks the moment there's a tie at the boundary you're filtering on, regardless of table size, e.g. two tied highest salaries means `rn = 2` returns the second copy of the *highest* salary, not the true second-highest distinct value.
+- **`RANK`**: ties share a rank, but the next rank *skips* ahead (2, 2, then 4). Mirrors a race: two tied for 2nd, nobody gets 3rd. Danger: if ties exist above your target position, the exact number you're filtering for may never appear in the output at all (e.g. a tie at position 55 means rank 56 might not exist, jumping straight to 58).
+- **`DENSE_RANK`**: ties share a rank, no skipping (2, 2, 3). Guarantees every position number appears in the output regardless of ties above it, making it the safer choice for "find the Nth distinct value" questions.
 
 This is the actual fix for the "Top N per group" ties problem flagged elsewhere in this sheet: `ORDER BY ... LIMIT N` arbitrarily picks one of the tied rows with no guaranteed stability. `RANK`/`DENSE_RANK` make the tie explicit in the output instead of hiding it.
 
@@ -260,6 +262,26 @@ SUM(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS running_tota
 SUM(spend) OVER (PARTITION BY user_id) AS user_total_spend
 ```
 The same aggregate functions already covered can run in "window mode." With `ORDER BY` inside `OVER`, the aggregate becomes cumulative (a running total). Without it, the aggregate computes once per partition and repeats that value on every row in the partition, useful for showing each row alongside a group total without needing the CTE+JOIN pattern from Row-Level Value vs Per-Group Baseline below, this does it in one pass.
+
+### Frame Clauses: Controlling How Much of the Partition Each Row Sees
+`PARTITION BY`/`ORDER BY` define which rows exist in a partition and their order. They don't by default control *how much* of that ordered partition each row's calculation actually looks at, that's what an explicit frame clause is for, needed for genuine rolling/moving calculations (e.g. "3-day rolling average") rather than a full running total.
+
+```sql
+-- 3-calendar-day rolling average (today + 2 preceding calendar days)
+AVG(tweet_count) OVER (
+    PARTITION BY user_id
+    ORDER BY tweet_date
+    RANGE BETWEEN INTERVAL '2' DAY PRECEDING AND CURRENT ROW
+)
+```
+- **`BETWEEN ... AND ...`**: the sliding window's boundaries, relative to the current row
+- **`INTERVAL '2' DAY PRECEDING`**: window start, 2 days before the current row's date
+- **`CURRENT ROW`**: window end, the row itself
+- **`RANGE`**: boundary measured by actual *value* distance (here, calendar days), not row count. Correctly includes "everything within 2 calendar days" even across date gaps in the data, a user with a missing day still gets the right calendar window, not a fixed row count that could span more or less real time than intended.
+
+**`RANGE` vs `ROWS`:** `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` measures by literal row count instead, "the 2 rows before this one," regardless of what dates those rows actually fall on. If the data has gaps (missing dates), `ROWS` and `RANGE` can give different results for what's supposed to be the same "3-day" window. Use `RANGE` with an `INTERVAL` when the requirement is genuinely calendar-based and gaps are possible; `ROWS` is more broadly supported across dialects and fine when one row per period is guaranteed with no gaps.
+
+**Default frame when omitted:** if `ORDER BY` is present inside `OVER` but no explicit frame clause is given, most engines default to `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, i.e. "everything from the start of the partition through the current row." This is why a plain running total (`SUM(x) OVER (PARTITION BY ... ORDER BY ...)`, no frame clause written) already works as shown above, that behavior is the implicit default frame, not something requiring extra syntax. An explicit frame clause is only needed to narrow that default window, e.g. to a fixed number of preceding days/rows instead of the whole partition history.
 
 ---
 
@@ -327,6 +349,15 @@ FROM viewership;
 - `SUM()` over that flag counts how many rows matched
 - One pass over the table counts multiple buckets at once, instead of separate filtered queries per condition
 - Combine with GROUP BY to get the same breakdown per group (e.g. per date)
+
+**What goes inside THEN determines what's being aggregated.** `THEN 1` counts matching *rows* (occurrences). `THEN <column>` sums that column's actual *value* across matching rows. These give genuinely different numbers, e.g. "how many send events happened" (THEN 1) vs "how much total time was spent on send events" (THEN time_spent). Check the question's phrasing: "how many"/"count of"/"number of" → THEN 1; "total"/"sum of"/"amount of [quantity]" → THEN the actual column.
+
+### FILTER (WHERE...) — Postgres alternative to SUM(CASE WHEN...)
+```sql
+-- Equivalent to SUM(CASE WHEN activity_type = 'send' THEN time_spent ELSE 0 END)
+SUM(time_spent) FILTER (WHERE activity_type = 'send') AS send_time
+```
+[FACT] Functionally equivalent to `SUM(CASE WHEN condition THEN column ELSE 0 END)`, just more explicit: "only feed rows matching this condition into the aggregate," stated directly rather than simulated through conditional zeroing. **Dialect gap: PostgreSQL supports `FILTER` natively; MySQL and SQL Server do not support it at all** (syntax error). `SUM(CASE WHEN...)` remains the portable choice across dialects; `FILTER` is a cleaner Postgres-specific shorthand when the target engine is known to be Postgres.
 
 ### Conditional Running Balance (signed SUM+CASE)
 Instead of flagging 1/0, flag with the signed value itself to compute a net balance in one pass, no join needed:
@@ -535,6 +566,7 @@ SELECT * FROM step2;
 - Best for multi-step investigations (raw data -> flag anomalies -> aggregate), since each step gets a readable name instead of nested parentheses
 - Also the standard way to build two-level aggregation (the histogram pattern), or to isolate a window function so its result can be filtered (see Window Functions above)
 - Watch out: chaining two CTEs and then INNER JOINing them (e.g. one CTE per category) silently drops entities that only appear in one CTE. Check whether a single-pass GROUP BY + CASE avoids this risk entirely before reaching for the two-CTE-plus-JOIN pattern
+- Not strictly required to sequence GROUP BY before a window function in the same query, since window functions naturally run after GROUP BY resolves (see Execution Order above); still often used for readability even when not functionally necessary
 
 ---
 
@@ -703,15 +735,18 @@ ORDER BY total_loss DESC;
 ```
 E.g. total loss per manufacturer where loss = cogs - total_sales per drug. Filter rows first if needed, then SUM the raw expression grouped by the entity, alongside COUNT for a per-group count. **Do not add the raw expression itself to GROUP BY** to satisfy the full-GROUP-BY rule, that silently fragments groups (see GROUP BY silent group-fragmentation trap above).
 
-### Conditional breakdown by category
+### Conditional breakdown by category, including time/quantity totals not just counts
 ```sql
 SELECT
-    date,
-    SUM(CASE WHEN device_type = 'laptop' THEN 1 ELSE 0 END) AS laptop_views,
-    SUM(CASE WHEN device_type IN ('tablet', 'phone') THEN 1 ELSE 0 END) AS mobile_views
-FROM viewership
-GROUP BY date;
+    age.age_bucket,
+    SUM(CASE WHEN activities.activity_type = 'send' THEN activities.time_spent ELSE 0 END) AS send_time,
+    SUM(CASE WHEN activities.activity_type = 'open' THEN activities.time_spent ELSE 0 END) AS open_time
+FROM activities
+INNER JOIN age_breakdown AS age ON activities.user_id = age.user_id
+WHERE activities.activity_type IN ('send', 'open')
+GROUP BY age.age_bucket;
 ```
+Same SUM+CASE shape as a simple category breakdown, but summing an actual quantity column instead of counting 1/0 flags, see "what goes inside THEN" note above. When the relevant dimension (e.g. age bucket) lives in a different table than the raw event data, join first, then group by the target dimension in the same query.
 
 ### Rate/ratio between two conditional counts
 ```sql
@@ -781,7 +816,21 @@ WHERE rn = 3;
 ```
 GROUP BY collapses rows and loses access to other columns, so this needs a window function: `ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY date_col ASC/DESC)`, then filter on `rn` in an outer query. See Window Functions above.
 
-### Top N per group ranking, with ties
+### Top N per group, using aggregated totals, with ties
+```sql
+SELECT category, product, total_spend
+FROM (
+    SELECT category, product, SUM(spend) AS total_spend,
+           ROW_NUMBER() OVER (PARTITION BY category ORDER BY SUM(spend) DESC) AS rnk
+    FROM product_spend
+    WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01'
+    GROUP BY category, product
+) ranked
+WHERE rnk IN (1, 2);
+```
+Top N *by an aggregated total* (e.g. total spend per product, not raw per-row spend) needs the aggregation and the ranking together: GROUP BY the entity being ranked (here, product within category) first so duplicate rows for the same entity are combined, then rank by that aggregate. GROUP BY and the window function can coexist in one query (see Execution Order above), a separate CTE purely to sequence them isn't required, though it can aid readability. Use `IN (1, 2)` rather than `= 1 OR rnk = 2` to select multiple rank positions safely, see the IN vs OR precedence note below.
+
+### Top N per group ranking, with ties (simple, non-aggregated case)
 ```sql
 SELECT sender_id, COUNT(*) AS message_count
 FROM messages
@@ -790,42 +839,6 @@ ORDER BY message_count DESC
 LIMIT 2;
 ```
 `ORDER BY ... LIMIT N` only works safely if no ties are expected in the data. If ties are possible and must be handled correctly, use `RANK()` or `DENSE_RANK()` instead (see Window Functions above) — `LIMIT` arbitrarily picks one of the tied rows with no guaranteed stability, while `RANK`/`DENSE_RANK` make the tie explicit in the output.
-
----
-
-## Recurring Mistake Patterns to Watch For
-
-**Reaching for a subquery, self-join, or multi-CTE-plus-JOIN by default when the real need is a single-pass GROUP BY + aggregate (possibly with CASE).**
-
-Test before writing the query: am I comparing across genuinely separate/unrelated data, or do I just need a value computed within a group I already have?
-
-Deeper test: does the output need to stay at row-level granularity, or collapse to one row per group?
-- If row-level detail must be kept alongside a group-level or whole-table aggregate, GROUP BY alone cannot do it — need a subquery/CTE+JOIN or a window function.
-- Finding duplicates specifically is almost always `GROUP BY + HAVING COUNT(*) > 1`, not a self-join, but remember GROUP BY collapses rows, so it only confirms/counts duplicates, it doesn't show them at row level.
-- A distribution/histogram question is two-level GROUP BY, not a special feature. Don't be thrown by unfamiliar terminology, translate it into "what per-entity number, then group by that number."
-- Splitting a category comparison into separate CTEs per category then INNER JOINing them is a common instinct but risks dropping entities that only appear in one category; check whether a single-pass signed SUM+CASE answers the question instead.
-
-**When a full-GROUP-BY error appears because a raw expression is unaggregated in SELECT**, the fix is to aggregate that expression (SUM/COUNT/etc), **not** to add it to GROUP BY. Adding it "fixes" the syntax error but silently fragments groups into near-row-level buckets and produces a wrong-but-valid result with no error to flag it. This is a worse failure mode than the original error, since nothing signals it except manually checking the output.
-
-**Defaulting to LEFT JOIN out of habit rather than deliberately choosing JOIN type.**
-
-"It's worked so far" isn't evidence the habit is safe, it just means the practice data hasn't exposed the gap yet. Ask which JOIN type reflects what's actually known or expected about the data before writing it.
-
-**Filtering the right table's column in WHERE instead of ON, when a LEFT JOIN must preserve unmatched left rows.** See the LEFT JOIN section above.
-
-**Using COUNT(CASE...) with an ELSE clause when SUM(CASE...) is needed.** See the COUNT vs SUM trap above.
-
-**Forgetting integer division truncates and needs an explicit numeric coercion**, and separately, **hitting Postgres's `ROUND(double precision, integer) does not exist` error and not recognizing it as a numeric-cast issue distinct from truncation.** Two related but different failure modes, see above.
-
-**Casting only at the final operation instead of at the earliest point precision/range could matter.** See Cast Timing above.
-
-**Using EXTRACT(DAY) subtraction instead of DATEDIFF/date subtraction for elapsed-time math.** See the trap above.
-
-**Trying to filter a window function's result (ROW_NUMBER, RANK, etc) directly in WHERE or HAVING in the same query.** Window functions compute after those clauses run; always wrap in a subquery/CTE and filter in the outer layer.
-
-**Assuming a reader will infer a fix's purpose without it being visually near the actual risk point** (e.g. a bare `1.0` literal placed far from the division it's fixing). Write for the reader who hasn't hit the specific gotcha yet, not just for someone with identical background/experience.
-
-**Before asking outside for syntax help, check this cheat sheet first.** Several lookups have turned out to already be answered here.
 
 ---
 
@@ -849,6 +862,26 @@ WHERE (status = 'completed' OR status = 'shipped')
 - Always use brackets when mixing AND and OR in the same WHERE clause
 - If a query returns unexpected results, check your AND/OR grouping first
 
+**Real case study — a date filter silently bypassed:**
+```sql
+-- BROKEN: the date range only applies to the rn = 1 branch
+WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND rnk = 1 OR rnk = 2
+
+-- Actually parses as:
+WHERE (transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND rnk = 1)
+   OR (rnk = 2)
+```
+Any row with `rnk = 2`, from **any date**, passes the WHERE clause, the date filter is completely bypassed for that branch. Two fixes, both eliminate the bare `OR`:
+```sql
+-- Fix 1: brackets
+WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND (rnk = 1 OR rnk = 2)
+
+-- Fix 2: IN, when the OR'd conditions are all equality checks on the same column
+WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND rnk IN (1, 2)
+```
+
+**IN vs the AND/OR precedence trap — what IN actually replaces.** `column IN (val1, val2, ...)` is a single self-contained condition, equivalent to `column = val1 OR column = val2 OR ...` collapsed into one. It combines freely with `AND`, with no precedence risk, e.g. `date >= x AND date < y AND status IN ('open', 'pending')` needs no brackets. **This is not because `IN` has a special relationship with `AND`.** The precedence danger is specifically about a literal `OR` sitting in the same WHERE clause as an `AND`; `IN` sidesteps it only because it removes the `OR` from the query entirely by expressing the "any of these values" logic as one condition instead of several OR'd ones. When several OR'd equality checks against the *same column* are mixed with AND, prefer `IN` over manual OR + brackets, both work, but `IN` removes the ambiguity source rather than just working around it.
+
 ---
 
 ## Style Rules
@@ -867,4 +900,5 @@ WHERE (status = 'completed' OR status = 'shipped')
 - Cast to numeric/decimal at the earliest point in an expression where precision or range could matter, not just wherever the current symptom surfaces
 - Use ORDER BY as a standing habit even when not strictly required, to keep it from becoming a lookup-every-time item
 - When a raw per-row expression triggers a full-GROUP-BY error, aggregate the expression, never add it to GROUP BY as a workaround
+- Prefer `IN (val1, val2, ...)` over multiple OR'd equality checks on the same column, especially when combined with AND elsewhere in the WHERE clause, it removes the AND/OR precedence risk rather than requiring careful bracketing
 - Write for the reader who hasn't already internalized your reasoning, not just for someone with identical background/experience
