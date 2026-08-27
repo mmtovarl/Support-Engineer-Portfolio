@@ -11,6 +11,7 @@ This explains why:
 - ORDER BY can reference aliases (it runs after SELECT)
 - Window function results (ROW_NUMBER, RANK, LAG, etc) can't be filtered in the same query's WHERE or HAVING, since those clauses run before window functions are computed. Always wrap in a subquery/CTE and filter in the outer layer.
 - **GROUP BY + aggregates and window functions CAN combine in a single query, no CTE required for this reason alone.** Window functions run in the SELECT phase, after GROUP BY has already collapsed rows and resolved aggregates. So `ROW_NUMBER() OVER (... ORDER BY SUM(spend) DESC)` alongside `GROUP BY category, product` in the same SELECT is valid: by the time the window function runs, `SUM(spend)` is already a finished per-group value, not a raw per-row one. A CTE is often still clearer to read (one step per layer), but it isn't functionally required just to sequence aggregation before windowing.
+- A JOIN used inside a subquery that also contains a window function isn't "inside the window function", FROM/JOIN resolve before SELECT (where window functions compute) regardless of what else lives in that SELECT. It's just two ordinary sequential steps in the usual order, nothing special about combining them.
 
 ---
 
@@ -40,6 +41,11 @@ WHERE (quantity_on_hand - quantity_reserved) < 5  -- use brackets for clarity
 - Cannot reference SELECT aliases here
 - Always use IS NULL / IS NOT NULL, never = NULL or != NULL
 
+### IN vs Comparison Operators — pick the one that matches the underlying question
+- **`IN (val1, val2, ...)`**: for a specific, often non-contiguous or non-numeric set of discrete values, e.g. `status IN ('open', 'pending', 'escalated')`, or `rank IN (1, 3, 5)` if odd positions specifically matter.
+- **Comparison operators (`<=`, `>=`, `<`, `>`, `BETWEEN`)**: for a threshold or range concept, e.g. "top N", "ranks 1 through N", "values under some cutoff" → `rank <= 3`, not `rank IN (1,2,3)`.
+- These can coincidentally produce identical results for a small N (`rank <= 3` and `rank IN (1,2,3)` are the same rows), but they express different underlying concepts and scale differently: `<=` scales trivially to "top 50" with no change, `IN` would require listing 50 values. Pick the one that mirrors the real shape of the question, not whichever happens to match today's specific N.
+
 ### JOIN Types
 ```sql
 -- INNER JOIN (same as JOIN): only rows with matches in both tables
@@ -67,6 +73,7 @@ LEFT JOIN sync_log ON bookings.booking_id = sync_log.booking_id
 - Never chain ON clauses: `ON table1.id = table2.id = table3.id` is invalid
 - Always use table.column notation in ON clauses for clarity
 - **Prefer `ON` over `USING`**, even when both tables share an identically-named column (e.g. `USING (user_id)`). `USING` merges the joined column into a single collapsed output column, losing the ability to reference `table.column` separately afterward, and it breaks the moment column names differ across tables, which happens constantly in real schemas
+- **Prefer joining late over joining early, when the join is only needed for a display label.** If a second table (e.g. `department`) is only needed to translate an ID into a human-readable name, and the first table is being filtered/ranked/aggregated down to a small subset anyway (e.g. top 3 per group), do the filtering/ranking first against the primary table alone, then join the lookup table afterward, only against the rows that survived. Joining early means the second table gets dragged through every intermediate step even though only a few final rows actually need it. Both orderings are usually correct, but joining late is the better default habit, less unnecessary work carried through the query, and it separates "what data answers the question" from "what label do I display."
 
 **Watch out:** a LEFT JOIN followed by a WHERE condition on the right table's column silently behaves like an INNER JOIN. Unmatched rows get NULL on the right side, and any comparison against NULL (`=`, `!=`, `>`, `<`) evaluates to NULL, not TRUE, so WHERE drops those rows anyway. If a LEFT JOIN isn't preserving unmatched rows in practice, check whether a WHERE clause is silently filtering them back out.
 
@@ -210,6 +217,27 @@ function_name() OVER (PARTITION BY grouping_column ORDER BY sort_column)
 - **`ORDER BY`** (inside `OVER`): the order rows are considered in *within* their partition. Only matters for functions that care about sequence (ranking, previous/next row, running totals)
 - Window functions are computed in the SELECT phase, after WHERE/GROUP BY/HAVING have already run (see Execution Order above). This means their results **cannot be filtered in the same query's WHERE or HAVING**, since those clauses execute before the window function's output exists. Always wrap the windowed query in a subquery or CTE and filter in the outer layer.
 - **Combines freely with GROUP BY in the same query, no CTE required just for sequencing.** Since window functions run after GROUP BY/aggregates are resolved, an aggregate expression can be referenced directly inside a window function's `OVER (...)` in the same SELECT, e.g. `ROW_NUMBER() OVER (PARTITION BY category ORDER BY SUM(spend) DESC)` alongside `GROUP BY category, product`. A CTE is still often clearer for readability, but it isn't functionally necessary purely to pre-aggregate before windowing.
+- A JOIN in the same subquery as a window function isn't "inside" the window function, JOIN resolves in FROM, before SELECT/window functions run, per execution order. No special interaction, just two ordinary sequential steps. Consider whether that join needs to happen before or after the window function's filtering step, see the join-late-vs-join-early note under JOIN Types above, it applies here too, particularly when the joined table is only needed for a display label on the rows that survive a rank filter.
+
+### ORDER BY inside OVER() controls tie-breaking for the FULL tuple — a real trap
+For `RANK`/`DENSE_RANK`, two rows are only treated as tied if **every** column listed in the window's `ORDER BY` matches between them, not just the first or the "important" one. Adding an extra column that's unique per row (e.g. a name) can silently destroy ties you actually wanted preserved:
+```sql
+-- BROKEN: name breaks ties on salary, since the full tuple (salary, name) differs
+-- even when salary alone is identical between two employees
+DENSE_RANK() OVER (
+    PARTITION BY department.department_name
+    ORDER BY department.department_name ASC, employee.salary DESC, employee.name ASC
+) AS salary_rank
+
+-- CORRECT: only salary should determine ties
+DENSE_RANK() OVER (
+    PARTITION BY department.department_name
+    ORDER BY employee.salary DESC
+) AS salary_rank
+```
+With `name` included in the window's `ORDER BY`, two employees who genuinely share a salary get **different** ranks, since their full `(salary, name)` tuples differ, degenerating `DENSE_RANK` toward `ROW_NUMBER`-like behavior and silently changing "top 3 salary tiers, however many people share them" into "top 3 individually-ranked rows," a different, narrower question. If display ordering by name is also wanted, put `name` in the outer query's `ORDER BY` instead, that only affects final row order, not how ranks were computed.
+
+**Columns already fixed by PARTITION BY are redundant in the window's ORDER BY.** A column can't vary within its own partition, so including it in `ORDER BY` inside the same `OVER (...)` does nothing, there's nothing left to break a tie on. Not harmful, just inert clutter. Only include columns in the window's `ORDER BY` that can genuinely vary within a partition and should influence ranking/tie behavior there.
 
 ### ROW_NUMBER, RANK, DENSE_RANK — the ranking family
 ```sql
@@ -567,6 +595,7 @@ SELECT * FROM step2;
 - Also the standard way to build two-level aggregation (the histogram pattern), or to isolate a window function so its result can be filtered (see Window Functions above)
 - Watch out: chaining two CTEs and then INNER JOINing them (e.g. one CTE per category) silently drops entities that only appear in one CTE. Check whether a single-pass GROUP BY + CASE avoids this risk entirely before reaching for the two-CTE-plus-JOIN pattern
 - Not strictly required to sequence GROUP BY before a window function in the same query, since window functions naturally run after GROUP BY resolves (see Execution Order above); still often used for readability even when not functionally necessary
+- A CTE that ranks/filters against one table, with a second table joined only afterward for a display label, is the join-late pattern (see JOIN Types above), often preferable to joining both tables inside the CTE before ranking
 
 ---
 
@@ -816,19 +845,21 @@ WHERE rn = 3;
 ```
 GROUP BY collapses rows and loses access to other columns, so this needs a window function: `ROW_NUMBER() OVER (PARTITION BY group_col ORDER BY date_col ASC/DESC)`, then filter on `rn` in an outer query. See Window Functions above.
 
-### Top N per group, using aggregated totals, with ties
+### Top N per group by rank/value, joining a lookup table only for display
 ```sql
-SELECT category, product, total_spend
-FROM (
-    SELECT category, product, SUM(spend) AS total_spend,
-           ROW_NUMBER() OVER (PARTITION BY category ORDER BY SUM(spend) DESC) AS rnk
-    FROM product_spend
-    WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01'
-    GROUP BY category, product
-) ranked
-WHERE rnk IN (1, 2);
+-- Join-late version: rank first against the primary table alone, join for the label after
+WITH ranked_salary AS (
+    SELECT name, salary, department_id,
+           DENSE_RANK() OVER (PARTITION BY department_id ORDER BY salary DESC) AS ranking
+    FROM employee
+)
+SELECT d.department_name, s.name, s.salary
+FROM ranked_salary AS s
+INNER JOIN department AS d ON s.department_id = d.department_id
+WHERE s.ranking <= 3
+ORDER BY d.department_name ASC, s.salary DESC, s.name ASC;
 ```
-Top N *by an aggregated total* (e.g. total spend per product, not raw per-row spend) needs the aggregation and the ranking together: GROUP BY the entity being ranked (here, product within category) first so duplicate rows for the same entity are combined, then rank by that aggregate. GROUP BY and the window function can coexist in one query (see Execution Order above), a separate CTE purely to sequence them isn't required, though it can aid readability. Use `IN (1, 2)` rather than `= 1 OR rnk = 2` to select multiple rank positions safely, see the IN vs OR precedence note below.
+Ranking (and any GROUP BY, if aggregating first) happens against the primary table alone; the lookup table is only joined afterward, against the rows that survived the rank filter, rather than being carried through every row from the start (see join-late-vs-join-early note under JOIN Types above). Both this ordering and joining-then-ranking are usually correct, but this is the better default habit. Keep the window's `ORDER BY` limited to the column(s) that should actually determine ties (here, just `salary`), never add a uniquely-valued tiebreaker column (like `name`) inside `OVER (...)`, that silently breaks legitimate ties (see ORDER BY inside OVER() trap above). Any display-only sort order (like sorting by name within a rank) belongs in the outer query's `ORDER BY`, not inside the window function. Use a range comparison (`<= 3`) rather than `IN (1,2,3)` for a "top N" filter, see IN vs Comparison Operators above.
 
 ### Top N per group ranking, with ties (simple, non-aggregated case)
 ```sql
@@ -895,10 +926,13 @@ WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND r
 - Table aliases are most useful when referencing the same table twice in one query (e.g. correlated subqueries, self-joins), not just for saving keystrokes
 - Always spell out `INNER JOIN` rather than bare `JOIN`, even though they're identical, as a forcing function for deliberate JOIN-type choice
 - Prefer `ON` over `USING` for JOINs, even when column names match exactly
+- Prefer joining late (only against rows already filtered/ranked down) over joining early and carrying a lookup table through every step, especially when the joined table is only needed for a display label
 - ALWAYS alias BOTH sides of a self-join symmetrically with role-based names, never leave one side unaliased
 - Always explicitly alias aggregate function outputs, never rely on implicit default naming
 - Cast to numeric/decimal at the earliest point in an expression where precision or range could matter, not just wherever the current symptom surfaces
 - Use ORDER BY as a standing habit even when not strictly required, to keep it from becoming a lookup-every-time item
 - When a raw per-row expression triggers a full-GROUP-BY error, aggregate the expression, never add it to GROUP BY as a workaround
 - Prefer `IN (val1, val2, ...)` over multiple OR'd equality checks on the same column, especially when combined with AND elsewhere in the WHERE clause, it removes the AND/OR precedence risk rather than requiring careful bracketing
+- Prefer comparison operators (`<=`, `>=`, `BETWEEN`) over `IN` for range/threshold-style filters like "top N", even when both would produce the same rows for a given N, match the operator to the underlying concept
+- Keep a window function's `ORDER BY` (inside `OVER`) limited to columns that should genuinely affect ranking/tie behavior; never include a uniquely-valued column there just for display purposes, and never repeat a column already fixed by `PARTITION BY`, it's inert. Put display-only sort preferences in the outer query's `ORDER BY` instead
 - Write for the reader who hasn't already internalized your reasoning, not just for someone with identical background/experience
