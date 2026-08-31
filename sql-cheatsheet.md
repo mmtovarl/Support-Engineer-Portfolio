@@ -56,9 +56,18 @@ INNER JOIN payments ON orders.order_id = payments.order_id
 FROM orders
 LEFT JOIN payments ON orders.order_id = payments.order_id
 
+-- RIGHT JOIN: all rows from right table, NULLs where no match on left
+FROM orders
+RIGHT JOIN payments ON orders.order_id = payments.order_id
+
 -- FULL OUTER JOIN: all rows from BOTH tables, NULLs on whichever side has no match
 FROM deposits
 FULL OUTER JOIN withdrawals ON deposits.account_id = withdrawals.account_id
+
+-- CROSS JOIN: every row from the left table paired with every row from the right
+-- (Cartesian product, no ON clause) — use deliberately, rarely by accident
+FROM orders
+CROSS JOIN order_counts
 
 -- Multiple JOINs: each gets its own ON clause
 FROM bookings
@@ -66,8 +75,10 @@ LEFT JOIN payments ON bookings.booking_id = payments.booking_id
 LEFT JOIN sync_log ON bookings.booking_id = sync_log.booking_id
 ```
 - Use LEFT JOIN when you need to find missing records (NULL on right side), or when you genuinely expect some rows might not have a match and want to keep them anyway
+- **RIGHT JOIN is functionally a mirrored LEFT JOIN** (swap the table order and it's identical) — rarely used in practice since writing it as LEFT JOIN with tables reordered is the more common convention, but know it cold for reading unfamiliar queries
 - Use INNER JOIN (or bare JOIN) when a match is expected to always exist
 - Use FULL OUTER JOIN when combining two independently-aggregated result sets (e.g. two CTEs, one per category) and every entity from either side must appear in the output, even if it only has data on one side
+- **Use CROSS JOIN when broadcasting a single computed value** (e.g. a one-row CTE total) to every row of another table — see Subqueries §4 below (Broadcasting a single aggregate value to every row). Almost never appropriate between two multi-row tables; that's usually a missing or wrong ON condition, not an intentional Cartesian product
 - **`JOIN` and `INNER JOIN` are functionally identical** (INNER is the implicit default), but write `INNER JOIN` explicitly. It's a forcing function to consciously decide whether a match should always exist, rather than defaulting to LEFT JOIN out of habit because "it's worked so far." LEFT JOIN defaulting can mask real data integrity issues (orphaned rows with no valid foreign key) that are worth knowing about, not silently including
 - **INNER JOIN between two separately-aggregated CTEs silently drops rows that exist in only one CTE** (e.g. an account with deposits but no withdrawals never appears in the result). If every entity must appear regardless of which side has data, use FULL OUTER JOIN + COALESCE, or better, check whether a single-pass GROUP BY + CASE avoids the join entirely (see Conditional Running Balance below)
 - Never chain ON clauses: `ON table1.id = table2.id = table3.id` is invalid
@@ -115,7 +126,18 @@ ORDER BY COUNT(action_type) DESC;
 - Cannot use aliases in HAVING, must repeat the expression
 - Always comes before ORDER BY
 
-**The full-GROUP-BY rule:** every column in SELECT must be either inside an aggregate function or listed in GROUP BY. No third option (a fixed literal also qualifies, since it's the same value across every row in the group). PostgreSQL and MySQL 5.7+ (`ONLY_FULL_GROUP_BY` default) both reject queries that violate this. Older MySQL used to silently pick an arbitrary row's value instead, which is dangerous since the result looks valid but is meaningless.
+**The full-GROUP-BY rule:** every column in SELECT must be either inside an aggregate function or listed in GROUP BY. Two structural options (aggregate, or GROUP BY list — a fixed literal counts as the latter, since it's identical across every row in the group), plus one dialect-dependent exception:
+
+[FACT] **Functional dependency on a primary key.** If GROUP BY includes a table's full primary key, PostgreSQL (9.1+) and MySQL (5.7+, `ONLY_FULL_GROUP_BY` default) both allow other non-aggregated columns from that same table into SELECT without listing them in GROUP BY — the PK guarantees exactly one value per group, so there's no ambiguity to resolve:
+```sql
+-- Valid in Postgres/MySQL 5.7+: author_id is the PK, so title needs no aggregation
+SELECT author_id, title
+FROM author
+GROUP BY author_id;
+```
+[FACT] **SQL Server does not support this exception** — it enforces the strict aggregate-or-GROUP-BY rule with no PK carve-out, regardless of key structure. Don't rely on this pattern if the query needs to be portable to SQL Server.
+
+Older MySQL (pre-5.7 default) used to silently pick an arbitrary row's value in non-dependent cases too, which is dangerous since the result looks valid but is meaningless — that's the *broken* version of this behavior, not the same thing as the legitimate PK-based functional dependency exception above.
 
 This is a **per-column rule, not a column-count limit, and not "first column plain, rest aggregate."** It's per-column and order-independent: any number of columns are fine as long as each one individually is either the GROUP BY column or wrapped in an aggregate:
 ```sql
@@ -260,6 +282,8 @@ The difference is entirely about how they treat ties. Given spend values `100, 9
 
 This is the actual fix for the "Top N per group" ties problem flagged elsewhere in this sheet: `ORDER BY ... LIMIT N` arbitrarily picks one of the tied rows with no guaranteed stability. `RANK`/`DENSE_RANK` make the tie explicit in the output instead of hiding it.
 
+**When the number is used as a strictly unique positional index (not a rank), use `ROW_NUMBER`, never `RANK`/`DENSE_RANK`.** Any downstream logic that depends on every row getting its own distinct sequential position, e.g. odd/even bucketing via `% 2`, pagination, "assign each row a unique slot", breaks silently if two rows can share a number. If two rows tie under `DENSE_RANK` and both land on the same value, both get classified into the same odd/even bucket, and the position that should have followed is skipped entirely, no error, just a wrong split. `ROW_NUMBER` guarantees one row per integer regardless of ties, which is what a positional index requires. Reach for `RANK`/`DENSE_RANK` only when ties should genuinely be reported as tied (leaderboard standings); reach for `ROW_NUMBER` when the number itself is going to be used as a unique handle for something else downstream.
+
 ### Finding the Nth row per group
 ```sql
 SELECT user_id, spend, transaction_date
@@ -310,6 +334,17 @@ AVG(tweet_count) OVER (
 **`RANGE` vs `ROWS`:** `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` measures by literal row count instead, "the 2 rows before this one," regardless of what dates those rows actually fall on. If the data has gaps (missing dates), `ROWS` and `RANGE` can give different results for what's supposed to be the same "3-day" window. Use `RANGE` with an `INTERVAL` when the requirement is genuinely calendar-based and gaps are possible; `ROWS` is more broadly supported across dialects and fine when one row per period is guaranteed with no gaps.
 
 **Default frame when omitted:** if `ORDER BY` is present inside `OVER` but no explicit frame clause is given, most engines default to `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, i.e. "everything from the start of the partition through the current row." This is why a plain running total (`SUM(x) OVER (PARTITION BY ... ORDER BY ...)`, no frame clause written) already works as shown above, that behavior is the implicit default frame, not something requiring extra syntax. An explicit frame clause is only needed to narrow that default window, e.g. to a fixed number of preceding days/rows instead of the whole partition history.
+
+**Gotcha: the default RANGE frame collapses tied rows in running totals.** This is a different problem from the RANGE-vs-ROWS date-gap issue above — it happens even with a single, ungapped date column, purely because of ties. `RANGE` groups by *value*, not row position: every row that ties on the window's `ORDER BY` column is treated as part of the same peer group, and **all peers in that group see the same frame boundary**, not an incrementing one row at a time.
+```sql
+-- If two transactions share the same transaction_date, both rows get the
+-- SAME running_total (the total through the end of that date's peer group),
+-- not two distinct incrementing values
+SUM(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS running_total
+```
+A user with two transactions on the same day won't see the running total step up between those two rows, it jumps to the combined total for that day on the first tied row and stays there for the second, rather than incrementing $50 then $120. No error, just a running total that silently doesn't run row-by-row where ties exist.
+
+**Fix:** if a strictly per-row increment is required regardless of ties, either switch to `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (measures by row position, not value, so ties don't merge frames), or add a tiebreaker column to the window's `ORDER BY` (e.g. a transaction id) so no two rows are ever fully tied on the full ordering tuple. Same tuple-matching mechanism as the `RANK`/`DENSE_RANK` tie-breaking trap above, applied to frame boundaries instead of rank position.
 
 ---
 
@@ -365,6 +400,26 @@ CASE WHEN condition THEN value ELSE other_value END
 ```
 - Used inline in SELECT, ORDER BY, WHERE
 - Useful for conditional sorting, labeling, or categorization
+
+**CASE evaluates top-to-bottom and stops at the first match — same model as a JS `if / else if / else if` chain, not a set of independently-checked conditions.** A later `WHEN` can be completely unreachable if an earlier, broader condition already catches every row it would have matched:
+```sql
+-- BROKEN: the third WHEN can never fire
+CASE 
+  WHEN order_id % 2 = 1 THEN order_id + 1
+  WHEN order_id % 2 = 0 THEN order_id - 1
+  WHEN order_id = (SELECT MAX(order_id) FROM orders) THEN order_id
+END
+```
+Every `order_id` is either odd or even, no exceptions, so the first two branches already cover 100% of rows before the engine ever reaches the third, even on the row where the third condition is technically true. **Fix: order conditions from most specific/exceptional to most general**, put the special case first:
+```sql
+-- CORRECT: the exception is checked before the general rule that would otherwise swallow it
+CASE 
+  WHEN order_id = (SELECT COUNT(order_id) FROM orders) AND order_id % 2 != 0 THEN order_id
+  WHEN order_id % 2 != 0 THEN order_id + 1
+  ELSE order_id - 1
+END
+```
+**Better default where possible: write conditions to be mutually exclusive rather than relying on ordering at all.** If two branches genuinely can't both be true for the same row (e.g. "odd and not the last row" vs "odd and the last row"), their relative order stops mattering, and a future edit that reorders them can't silently reintroduce a bug. Reserve order-dependent chains for cases where a condition is deliberately meant to catch "everything the prior branches didn't."
 
 ### SUM + CASE (conditional counting / pivoting)
 ```sql
@@ -495,6 +550,22 @@ Feb 1 minus Jan 30: EXTRACT(DAY) gives 1 - 30 = -29, not the real 2-day gap
 
 ### ::date Cast (Postgres shorthand for CAST(col AS DATE))
 Strips the time component from a `TIMESTAMP`, leaving just the calendar date. Needed when comparing "did X happen exactly N days after Y" using timestamp columns, since raw subtraction can carry a fractional-day remainder from the time-of-day portion (e.g. signup at 11pm, confirmation at 1am the next day, is only ~2 hours apart, not a clean 1-day gap), which can throw off an exact day-count match. Cast both sides to date first when the question is about calendar-day differences, not exact elapsed time.
+
+### DATE()/::date/CAST(AS DATE) vs EXTRACT(DAY) — grouping or partitioning by calendar day
+A second, distinct instance of the same underlying `EXTRACT(DAY)` trap above, this time in `GROUP BY`/`PARTITION BY` rather than elapsed-time subtraction. `EXTRACT(DAY FROM ts)` returns only the day-of-month digit (1–31), discarding month and year, so `2024-01-15` and `2024-02-15` both extract to `15` and get treated as the same group, silently merging unrelated calendar days that happen to share a day-of-month number.
+
+`DATE(ts)`, `ts::DATE` (Postgres shorthand), and `CAST(ts AS DATE)` (ANSI-standard, portable) all do the opposite: they truncate a timestamp down to its full calendar date, keeping year, month, and day together, only dropping the time-of-day. That's what "group by day" or "rank within each day" almost always means.
+
+```sql
+-- WRONG: merges every 15th of every month together
+PARTITION BY EXTRACT(DAY FROM measurement_time)
+
+-- CORRECT: one partition per real calendar day
+PARTITION BY DATE(measurement_time)
+PARTITION BY measurement_time::DATE        -- Postgres shorthand, equivalent
+PARTITION BY CAST(measurement_time AS DATE) -- ANSI-standard, portable across dialects
+```
+Rule of thumb: `EXTRACT()` pulls a single numeric component out of a date and never gives back a comparable date value, use it for filtering on a specific year/month/day-of-month, never for grouping, partitioning, or comparing "whole days" as units. For that, reach for `DATE()`/`CAST(AS DATE)`/`DATE_TRUNC('day', ...)` instead.
 
 ### YEAR() / MONTH()
 - **MySQL only**: extracts year/month as an integer.
@@ -639,6 +710,22 @@ WHERE products.price > (
 );
 ```
 Inner query references `products.product_id` from the outer query, running once per product row (slow on large tables). Must use an aggregate if multiple rows could match, otherwise SQLite may run silently with unreliable results (PostgreSQL/SQL Server would throw an error). Usually replaceable with a JOIN.
+
+### 4. Broadcasting a single aggregate value to every row — scalar subquery vs CROSS JOIN
+```sql
+-- Scalar subquery inside CASE, re-evaluated conceptually per row
+SELECT CASE WHEN order_id = (SELECT COUNT(order_id) FROM orders) THEN ... END
+FROM orders;
+
+-- CROSS JOIN with a single-row CTE, computed once and made available to every row
+WITH order_counts AS (
+    SELECT COUNT(order_id) AS total_orders FROM orders
+)
+SELECT CASE WHEN order_id = total_orders THEN ... END
+FROM orders
+CROSS JOIN order_counts;
+```
+Both give identical results when the subquery is non-correlated (doesn't reference anything from the outer row); PostgreSQL's planner recognizes this and evaluates it once rather than per row, so there's no guaranteed performance difference in Postgres specifically. The real advantage of the `CROSS JOIN` + single-row CTE form is **explicitness and portability**: the aggregate is computed exactly once, by name, in one place, rather than relying on a given engine's optimizer to notice the subquery is non-correlated and cache it, behavior that isn't guaranteed identically across every SQL dialect. Default to `CROSS JOIN` with a single-row CTE whenever a single aggregate value needs to be available across every row of a per-row calculation; treat the scalar-subquery form as equivalent but less self-documenting.
 
 ### When to use subqueries vs JOINs
 - Prefer JOIN: combining data from multiple tables for display, or when performance matters on large datasets
@@ -936,3 +1023,8 @@ WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND r
 - Prefer comparison operators (`<=`, `>=`, `BETWEEN`) over `IN` for range/threshold-style filters like "top N", even when both would produce the same rows for a given N, match the operator to the underlying concept
 - Keep a window function's `ORDER BY` (inside `OVER`) limited to columns that should genuinely affect ranking/tie behavior; never include a uniquely-valued column there just for display purposes, and never repeat a column already fixed by `PARTITION BY`, it's inert. Put display-only sort preferences in the outer query's `ORDER BY` instead
 - Write for the reader who hasn't already internalized your reasoning, not just for someone with identical background/experience
+- Use `DATE()`/`CAST(AS DATE)` (or `::DATE` in Postgres) when grouping/partitioning by calendar day; never `EXTRACT(DAY)`, which discards month/year and silently merges unrelated days that share a day-of-month number
+- Prefer `CAST(x AS TYPE)` over Postgres-only `::` shorthand, and prefer `SUM(CASE WHEN...)` over Postgres-only `FILTER (WHERE...)`, when portability across engines matters more than brevity
+- Use `ROW_NUMBER`, never `RANK`/`DENSE_RANK`, whenever the number itself will be used as a unique positional index downstream (pagination, odd/even bucketing, "assign each row a distinct slot"); reserve `RANK`/`DENSE_RANK` for when ties should genuinely be reported as tied
+- Write `CASE` conditions to be mutually exclusive where possible, rather than relying on top-to-bottom evaluation order for correctness; where an exception must be checked against a broader catch-all condition, the exception goes first, since CASE stops at the first match, same as a JS if/else-if chain
+- When a single aggregate value needs to be available to every row of a per-row calculation, default to `CROSS JOIN` with a single-row CTE over a scalar subquery, it's computed explicitly once rather than relying on the optimizer to recognize a non-correlated subquery
