@@ -56,18 +56,9 @@ INNER JOIN payments ON orders.order_id = payments.order_id
 FROM orders
 LEFT JOIN payments ON orders.order_id = payments.order_id
 
--- RIGHT JOIN: all rows from right table, NULLs where no match on left
-FROM orders
-RIGHT JOIN payments ON orders.order_id = payments.order_id
-
 -- FULL OUTER JOIN: all rows from BOTH tables, NULLs on whichever side has no match
 FROM deposits
 FULL OUTER JOIN withdrawals ON deposits.account_id = withdrawals.account_id
-
--- CROSS JOIN: every row from the left table paired with every row from the right
--- (Cartesian product, no ON clause) — use deliberately, rarely by accident
-FROM orders
-CROSS JOIN order_counts
 
 -- Multiple JOINs: each gets its own ON clause
 FROM bookings
@@ -75,10 +66,8 @@ LEFT JOIN payments ON bookings.booking_id = payments.booking_id
 LEFT JOIN sync_log ON bookings.booking_id = sync_log.booking_id
 ```
 - Use LEFT JOIN when you need to find missing records (NULL on right side), or when you genuinely expect some rows might not have a match and want to keep them anyway
-- **RIGHT JOIN is functionally a mirrored LEFT JOIN** (swap the table order and it's identical) — rarely used in practice since writing it as LEFT JOIN with tables reordered is the more common convention, but know it cold for reading unfamiliar queries
 - Use INNER JOIN (or bare JOIN) when a match is expected to always exist
 - Use FULL OUTER JOIN when combining two independently-aggregated result sets (e.g. two CTEs, one per category) and every entity from either side must appear in the output, even if it only has data on one side
-- **Use CROSS JOIN when broadcasting a single computed value** (e.g. a one-row CTE total) to every row of another table — see Subqueries §4 below (Broadcasting a single aggregate value to every row). Almost never appropriate between two multi-row tables; that's usually a missing or wrong ON condition, not an intentional Cartesian product
 - **`JOIN` and `INNER JOIN` are functionally identical** (INNER is the implicit default), but write `INNER JOIN` explicitly. It's a forcing function to consciously decide whether a match should always exist, rather than defaulting to LEFT JOIN out of habit because "it's worked so far." LEFT JOIN defaulting can mask real data integrity issues (orphaned rows with no valid foreign key) that are worth knowing about, not silently including
 - **INNER JOIN between two separately-aggregated CTEs silently drops rows that exist in only one CTE** (e.g. an account with deposits but no withdrawals never appears in the result). If every entity must appear regardless of which side has data, use FULL OUTER JOIN + COALESCE, or better, check whether a single-pass GROUP BY + CASE avoids the join entirely (see Conditional Running Balance below)
 - Never chain ON clauses: `ON table1.id = table2.id = table3.id` is invalid
@@ -126,18 +115,7 @@ ORDER BY COUNT(action_type) DESC;
 - Cannot use aliases in HAVING, must repeat the expression
 - Always comes before ORDER BY
 
-**The full-GROUP-BY rule:** every column in SELECT must be either inside an aggregate function or listed in GROUP BY. Two structural options (aggregate, or GROUP BY list — a fixed literal counts as the latter, since it's identical across every row in the group), plus one dialect-dependent exception:
-
-[FACT] **Functional dependency on a primary key.** If GROUP BY includes a table's full primary key, PostgreSQL (9.1+) and MySQL (5.7+, `ONLY_FULL_GROUP_BY` default) both allow other non-aggregated columns from that same table into SELECT without listing them in GROUP BY — the PK guarantees exactly one value per group, so there's no ambiguity to resolve:
-```sql
--- Valid in Postgres/MySQL 5.7+: author_id is the PK, so title needs no aggregation
-SELECT author_id, title
-FROM author
-GROUP BY author_id;
-```
-[FACT] **SQL Server does not support this exception** — it enforces the strict aggregate-or-GROUP-BY rule with no PK carve-out, regardless of key structure. Don't rely on this pattern if the query needs to be portable to SQL Server.
-
-Older MySQL (pre-5.7 default) used to silently pick an arbitrary row's value in non-dependent cases too, which is dangerous since the result looks valid but is meaningless — that's the *broken* version of this behavior, not the same thing as the legitimate PK-based functional dependency exception above.
+**The full-GROUP-BY rule:** every column in SELECT must be either inside an aggregate function or listed in GROUP BY. No third option (a fixed literal also qualifies, since it's the same value across every row in the group). PostgreSQL and MySQL 5.7+ (`ONLY_FULL_GROUP_BY` default) both reject queries that violate this. Older MySQL used to silently pick an arbitrary row's value instead, which is dangerous since the result looks valid but is meaningless.
 
 This is a **per-column rule, not a column-count limit, and not "first column plain, rest aggregate."** It's per-column and order-independent: any number of columns are fine as long as each one individually is either the GROUP BY column or wrapped in an aggregate:
 ```sql
@@ -305,6 +283,51 @@ LEAD(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS next_spend
 
 This is the standard tool for "how did this compare to last time" questions, e.g. spend change transaction-to-transaction. It's a genuinely different comparison from the row-vs-group-average CTE pattern below: that pattern measures distance from a *fixed group baseline*, `LAG`/`LEAD` measure distance from the *adjacent row specifically*, which is awkward to express without a window function at all.
 
+**Mental model:** each row reaches sideways to grab a value from its neighbor — but "neighbor" only means something *within its partition, in the order specified*. Get either wrong and the row silently grabs the wrong neighbor, no error, just a plausible-looking wrong number.
+
+**Worked example.** Given:
+
+| user_id | transaction_date | spend |
+|---|---|---|
+| 1 | 01-01 | 50 |
+| 1 | 01-05 | 80 |
+| 1 | 01-10 | 30 |
+| 2 | 01-03 | 100 |
+| 2 | 01-08 | 60 |
+
+```sql
+LAG(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS previous_spend
+```
+
+| user_id | transaction_date | spend | previous_spend |
+|---|---|---|---|
+| 1 | 01-01 | 50 | NULL |
+| 1 | 01-05 | 80 | 50 |
+| 1 | 01-10 | 30 | 80 |
+| 2 | 01-03 | 100 | NULL |
+| 2 | 01-08 | 60 | 100 |
+
+`PARTITION BY user_id` splits the table into independent sequences, one per user. `ORDER BY transaction_date` fixes the order within each. `LAG` steps backward one row inside that sequence; nothing ever crosses from user 1 into user 2. Each partition's first row has no predecessor, hence `NULL`.
+
+**Omitting `PARTITION BY` — the actual failure mode, not a hypothetical:**
+```sql
+-- BROKEN: one global sequence ordered by date, user identity ignored
+LAG(spend) OVER (ORDER BY transaction_date) AS previous_spend
+```
+Same data, now one merged sequence across both users:
+
+| transaction_date | user_id | spend | previous_spend (broken) |
+|---|---|---|---|
+| 01-01 | 1 | 50 | NULL |
+| 01-03 | 2 | 100 | 50 ← user 1's spend |
+| 01-05 | 1 | 80 | 100 ← user 2's spend |
+| 01-08 | 2 | 60 | 80 ← user 1's spend |
+| 01-10 | 1 | 30 | 60 ← user 2's spend |
+
+Every row after the first now references another user's spend as its "previous" value. No error is thrown, the values just look plausible while being wrong.
+
+**Rule:** if the question is "compare this row to something about *this entity specifically*" (previous transaction, previous login, previous month), `PARTITION BY <entity>` is not optional styling, it's what defines which rows are even eligible to be each other's neighbor. `ORDER BY` inside `OVER` only answers the secondary question of sequence *within* that group — both have to be right independently. This is the same class of bug as using `LAG`/`LEAD` (or any ranking/window function) with `ORDER BY` alone and expecting it to also do the job of grouping by entity; it doesn't, `PARTITION BY` is the only clause that does that.
+
 ### Aggregates as window functions (running totals, group totals without collapsing)
 ```sql
 -- Running cumulative sum per user (order matters for "running")
@@ -334,17 +357,6 @@ AVG(tweet_count) OVER (
 **`RANGE` vs `ROWS`:** `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` measures by literal row count instead, "the 2 rows before this one," regardless of what dates those rows actually fall on. If the data has gaps (missing dates), `ROWS` and `RANGE` can give different results for what's supposed to be the same "3-day" window. Use `RANGE` with an `INTERVAL` when the requirement is genuinely calendar-based and gaps are possible; `ROWS` is more broadly supported across dialects and fine when one row per period is guaranteed with no gaps.
 
 **Default frame when omitted:** if `ORDER BY` is present inside `OVER` but no explicit frame clause is given, most engines default to `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, i.e. "everything from the start of the partition through the current row." This is why a plain running total (`SUM(x) OVER (PARTITION BY ... ORDER BY ...)`, no frame clause written) already works as shown above, that behavior is the implicit default frame, not something requiring extra syntax. An explicit frame clause is only needed to narrow that default window, e.g. to a fixed number of preceding days/rows instead of the whole partition history.
-
-**Gotcha: the default RANGE frame collapses tied rows in running totals.** This is a different problem from the RANGE-vs-ROWS date-gap issue above — it happens even with a single, ungapped date column, purely because of ties. `RANGE` groups by *value*, not row position: every row that ties on the window's `ORDER BY` column is treated as part of the same peer group, and **all peers in that group see the same frame boundary**, not an incrementing one row at a time.
-```sql
--- If two transactions share the same transaction_date, both rows get the
--- SAME running_total (the total through the end of that date's peer group),
--- not two distinct incrementing values
-SUM(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS running_total
-```
-A user with two transactions on the same day won't see the running total step up between those two rows, it jumps to the combined total for that day on the first tied row and stays there for the second, rather than incrementing $50 then $120. No error, just a running total that silently doesn't run row-by-row where ties exist.
-
-**Fix:** if a strictly per-row increment is required regardless of ties, either switch to `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (measures by row position, not value, so ties don't merge frames), or add a tiebreaker column to the window's `ORDER BY` (e.g. a transaction id) so no two rows are ever fully tied on the full ordering tuple. Same tuple-matching mechanism as the `RANK`/`DENSE_RANK` tie-breaking trap above, applied to frame boundaries instead of rank position.
 
 ---
 
@@ -547,6 +559,20 @@ Date columns are numeric under the hood, which is why arithmetic works on them (
 Feb 1 minus Jan 30: EXTRACT(DAY) gives 1 - 30 = -29, not the real 2-day gap
 ```
 `EXTRACT(YEAR)`/`EXTRACT(MONTH)` are fine as WHERE filters (checking which year/month a date falls in), but do not use `EXTRACT(DAY)` subtraction to compute elapsed time between two dates. Use `DATEDIFF` or direct date subtraction instead, those operate on the actual underlying date value, not an extracted piece of it.
+
+**Generalized trap: `EXTRACT(part)` discards every component coarser than `part`, and equating on it alone silently ignores that discarded context.** `EXTRACT(DAY ...)` above is one instance; the same failure happens one level up with `EXTRACT(MONTH ...)`:
+```sql
+-- BROKEN: matches "same month, any year" — June 2021 satisfies this against July 2022
+WHERE EXTRACT(MONTH FROM last_month.event_date) =
+      EXTRACT(MONTH FROM curr_month.event_date - INTERVAL '1 month')
+```
+This compares only the month digit (1–12); the year is never checked. On a dataset that happens to contain only one year of data it produces correct-looking output, since there's nothing else for it to accidentally match against, but the query itself doesn't express "the immediately preceding month," it expresses "same calendar month, any year." **Rule: whenever a comparison is meant to identify one specific point in time (not just a recurring calendar position like "always December"), compare full date/timestamp values or truncated date values, never a single extracted component in isolation.** Use `DATE_TRUNC('month', date_col)` or direct date/interval subtraction instead:
+```sql
+-- CORRECT: compares full year-month values, not a bare digit
+WHERE DATE_TRUNC('month', last_month.event_date) =
+      DATE_TRUNC('month', curr_month.event_date) - INTERVAL '1 month'
+```
+`EXTRACT()` remains the right tool for genuinely recurring calendar-position filters (e.g. "every December regardless of year"), just not for "the month immediately before this one," which is a point-in-time comparison, not a calendar-position one.
 
 ### ::date Cast (Postgres shorthand for CAST(col AS DATE))
 Strips the time component from a `TIMESTAMP`, leaving just the calendar date. Needed when comparing "did X happen exactly N days after Y" using timestamp columns, since raw subtraction can carry a fractional-day remainder from the time-of-day portion (e.g. signup at 11pm, confirmation at 1am the next day, is only ~2 hours apart, not a clean 1-day gap), which can throw off an exact day-count match. Cast both sides to date first when the question is about calendar-day differences, not exact elapsed time.
