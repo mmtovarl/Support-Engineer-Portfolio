@@ -46,6 +46,93 @@ WHERE (quantity_on_hand - quantity_reserved) < 5  -- use brackets for clarity
 - **Comparison operators (`<=`, `>=`, `<`, `>`, `BETWEEN`)**: for a threshold or range concept, e.g. "top N", "ranks 1 through N", "values under some cutoff" → `rank <= 3`, not `rank IN (1,2,3)`.
 - These can coincidentally produce identical results for a small N (`rank <= 3` and `rank IN (1,2,3)` are the same rows), but they express different underlying concepts and scale differently: `<=` scales trivially to "top 50" with no change, `IN` would require listing 50 values. Pick the one that mirrors the real shape of the question, not whichever happens to match today's specific N.
 
+### Pattern Matching: LIKE, ILIKE and Wildcards
+
+**Mental model:** `=` asks "is this string identical?". `LIKE` asks "does this whole string fit this template?". The pattern must match the **entire** value, not just a piece of it (unlike regex, which matches anywhere unless anchored).
+
+#### The two wildcards
+
+| Wildcard | Matches | Example | Matches | Does not match |
+|---|---|---|---|---|
+| `%` | zero, one or many characters | `'A%'` | `A`, `Apple`, `Algorithm` | `apple` (case, see below) |
+| `_` | exactly one character | `'A_c'` | `Abc`, `Acc`, `A1c` | `Ac` (too short), `Abdc` (too long) |
+
+`_` matches **any** character (letter, digit, space, hyphen), not just letters.
+
+#### Common patterns
+
+```sql
+-- Starts with
+SELECT * FROM users WHERE name LIKE 'John%';
+
+-- Ends with
+SELECT * FROM users WHERE name LIKE '%son';
+
+-- Contains
+SELECT * FROM users WHERE email LIKE '%test%';
+
+-- Fixed length: 4 characters, starts with A, ends with e
+SELECT * FROM words WHERE word LIKE 'A__e';
+
+-- Exactly 6 characters, ends with h (5 underscores + h)
+SELECT * FROM worker WHERE first_name LIKE '_____h';
+```
+
+#### Fixed-length patterns: the counting trap
+
+Counting underscores by eye is error-prone and hard to audit. Two more readable equivalents:
+
+```sql
+-- Length check + suffix check (reads like the requirement)
+SELECT * FROM worker
+WHERE LENGTH(first_name) = 6
+  AND first_name LIKE '%h';
+
+-- PostgreSQL regex: strictly 5 letters then h (also enforces "letters only")
+SELECT * FROM worker WHERE first_name ~ '^[A-Za-z]{5}h$';
+```
+
+Use the underscore version when the pattern is short. Switch to `LENGTH()` when the count is large or when "letters only" matters, because `_` also matches digits and spaces.
+
+#### Rules and gotchas
+
+1. **Operator requirement.** Wildcards only work with `LIKE`, `NOT LIKE` (and `ILIKE` in PostgreSQL). With `=`, a `%` is just a literal percent sign.
+2. **Case sensitivity is dialect and collation dependent.**
+   - PostgreSQL: `LIKE` is case-sensitive, `ILIKE` is case-insensitive.
+   - MySQL: `LIKE` is usually case-insensitive under default collations.
+   - SQL Server: depends on the column or database collation.
+   - Oracle: `LIKE` is case-sensitive.
+   - `ILIKE` is not standard SQL. The portable approach is `LOWER(col) LIKE 'john%'`.
+3. **NULL.** `NULL LIKE '%'` returns NULL, so the row is filtered out. `NOT LIKE` also drops NULL rows. `'%'` matches the empty string but never NULL.
+4. **Escaping literal `%` or `_`.** Use `ESCAPE`:
+
+   ```sql
+   -- Values starting with the literal text "10%"
+   SELECT * FROM discounts WHERE label LIKE '10!%%' ESCAPE '!';
+   ```
+
+5. **Multiple patterns.** `LIKE 'A%' OR 'B%'` is invalid. Repeat the full condition, and mind AND/OR precedence:
+
+   ```sql
+   WHERE name LIKE 'A%' OR name LIKE 'B%'
+
+   -- PostgreSQL shorthand
+   WHERE name LIKE ANY (ARRAY['A%', 'B%'])
+   ```
+
+6. **Fixed-length CHAR columns.** Padding behaviour for `CHAR(n)` differs between dialects and can break fixed-length patterns. If counts look off, test with `LENGTH(col)` or `TRIM(col)`.
+
+#### Performance
+
+- A **leading wildcard** (`'%smith'`, or a leading `_`) means a standard B-tree index cannot be used to seek, so the database typically scans the whole table or the whole index.
+- A **trailing-only wildcard** (`'John%'`) can use a B-tree index. In PostgreSQL with a non-C locale this needs an index built with `text_pattern_ops`.
+- If leading-wildcard search on a big table is a real requirement, PostgreSQL's `pg_trgm` extension (trigram index) supports it.
+- On small tables none of this matters. It becomes a problem on large production tables or high-frequency queries.
+
+#### LIKE vs regex
+
+`LIKE` is simple and portable but limited (only `%` and `_`). For character classes, repetition counts or alternation, use regex: `~` / `~*` in PostgreSQL, `REGEXP` in MySQL.
+
 ### JOIN Types
 ```sql
 -- INNER JOIN (same as JOIN): only rows with matches in both tables
