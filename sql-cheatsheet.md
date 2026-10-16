@@ -41,7 +41,7 @@ WHERE (quantity_on_hand - quantity_reserved) < 5  -- use brackets for clarity
 - Cannot reference SELECT aliases here
 - Always use IS NULL / IS NOT NULL, never = NULL or != NULL
 
-### IN vs Comparison Operators — pick the one that matches the underlying question
+### IN vs Comparison Operators: pick the one that matches the underlying question
 - **`IN (val1, val2, ...)`**: for a specific, often non-contiguous or non-numeric set of discrete values, e.g. `status IN ('open', 'pending', 'escalated')`, or `rank IN (1, 3, 5)` if odd positions specifically matter.
 - **Comparison operators (`<=`, `>=`, `<`, `>`, `BETWEEN`)**: for a threshold or range concept, e.g. "top N", "ranks 1 through N", "values under some cutoff" → `rank <= 3`, not `rank IN (1,2,3)`.
 - These can coincidentally produce identical results for a small N (`rank <= 3` and `rank IN (1,2,3)` are the same rows), but they express different underlying concepts and scale differently: `<=` scales trivially to "top 50" with no change, `IN` would require listing 50 values. Pick the one that mirrors the real shape of the question, not whichever happens to match today's specific N.
@@ -148,7 +148,7 @@ ORDER BY total_loss DESC;
 ```
 If the raw expression is near-unique per row, `GROUP BY manufacturer, total_loss` doesn't give one row per manufacturer, it gives close to one row per manufacturer-per-item, since each item's raw value differs. Any aggregate alongside it (like `COUNT`) then computes over these tiny fragmented buckets, coming out as mostly 1s, instead of the real per-manufacturer number. No error is thrown, the query just silently answers a different, wrong question. **This is more dangerous than the hard-rejection version of the rule**, since nothing signals the mistake except manually checking whether the output actually makes sense. The correct fix is always to aggregate the expression (`SUM`, `COUNT`, etc), never to add it to GROUP BY as a workaround.
 
-**Composite GROUP BY (multiple columns) — mental model: composite buckets.** `GROUP BY col1, col2` creates one bucket per unique **combination** of both values, not sequential grouping. `GROUP BY country, device_type` creates a distinct bucket for every `(country, device_type)` pair, e.g. `(US, Mobile)`, `(US, Laptop)`, `(UK, Mobile)`, not "group by country, then subdivide by device."
+**Composite GROUP BY (multiple columns), mental model: composite buckets.** `GROUP BY col1, col2` creates one bucket per unique **combination** of both values, not sequential grouping. `GROUP BY country, device_type` creates a distinct bucket for every `(country, device_type)` pair, e.g. `(US, Mobile)`, `(US, Laptop)`, `(UK, Mobile)`, not "group by country, then subdivide by device."
 
 ```sql
 SELECT country, device_type, COUNT(user_id) AS total_users, SUM(view_count) AS total_views
@@ -219,7 +219,7 @@ function_name() OVER (PARTITION BY grouping_column ORDER BY sort_column)
 - **Combines freely with GROUP BY in the same query, no CTE required just for sequencing.** Since window functions run after GROUP BY/aggregates are resolved, an aggregate expression can be referenced directly inside a window function's `OVER (...)` in the same SELECT, e.g. `ROW_NUMBER() OVER (PARTITION BY category ORDER BY SUM(spend) DESC)` alongside `GROUP BY category, product`. A CTE is still often clearer for readability, but it isn't functionally necessary purely to pre-aggregate before windowing.
 - A JOIN in the same subquery as a window function isn't "inside" the window function, JOIN resolves in FROM, before SELECT/window functions run, per execution order. No special interaction, just two ordinary sequential steps. Consider whether that join needs to happen before or after the window function's filtering step, see the join-late-vs-join-early note under JOIN Types above, it applies here too, particularly when the joined table is only needed for a display label on the rows that survive a rank filter.
 
-### ORDER BY inside OVER() controls tie-breaking for the FULL tuple — a real trap
+### ORDER BY inside OVER() controls tie-breaking for the FULL tuple: a real trap
 For `RANK`/`DENSE_RANK`, two rows are only treated as tied if **every** column listed in the window's `ORDER BY` matches between them, not just the first or the "important" one. Adding an extra column that's unique per row (e.g. a name) can silently destroy ties you actually wanted preserved:
 ```sql
 -- BROKEN: name breaks ties on salary, since the full tuple (salary, name) differs
@@ -239,7 +239,7 @@ With `name` included in the window's `ORDER BY`, two employees who genuinely sha
 
 **Columns already fixed by PARTITION BY are redundant in the window's ORDER BY.** A column can't vary within its own partition, so including it in `ORDER BY` inside the same `OVER (...)` does nothing, there's nothing left to break a tie on. Not harmful, just inert clutter. Only include columns in the window's `ORDER BY` that can genuinely vary within a partition and should influence ranking/tie behavior there.
 
-### ROW_NUMBER, RANK, DENSE_RANK — the ranking family
+### ROW_NUMBER, RANK, DENSE_RANK: the ranking family
 ```sql
 ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY spend DESC)
 RANK()       OVER (PARTITION BY user_id ORDER BY spend DESC)
@@ -254,7 +254,7 @@ The difference is entirely about how they treat ties. Given spend values `100, 9
 | 90 | 3 | 2 | 2 |
 | 80 | 4 | 4 | 3 |
 
-- **`ROW_NUMBER`**: always unique (1, 2, 3, 4), ties broken arbitrarily by whichever row the engine processes first. Use when exactly one row per rank position is required, e.g. "the Nth row" — ties or not, you need a single row. Breaks the moment there's a tie at the boundary you're filtering on, regardless of table size, e.g. two tied highest salaries means `rn = 2` returns the second copy of the *highest* salary, not the true second-highest distinct value.
+- **`ROW_NUMBER`**: always unique (1, 2, 3, 4), ties broken arbitrarily by whichever row the engine processes first. Use when exactly one row per rank position is required, e.g. "the Nth row", ties or not, you need a single row. Breaks the moment there's a tie at the boundary you're filtering on, regardless of table size, e.g. two tied highest salaries means `rn = 2` returns the second copy of the *highest* salary, not the true second-highest distinct value.
 - **`RANK`**: ties share a rank, but the next rank *skips* ahead (2, 2, then 4). Mirrors a race: two tied for 2nd, nobody gets 3rd. Danger: if ties exist above your target position, the exact number you're filtering for may never appear in the output at all (e.g. a tie at position 55 means rank 56 might not exist, jumping straight to 58).
 - **`DENSE_RANK`**: ties share a rank, no skipping (2, 2, 3). Guarantees every position number appears in the output regardless of ties above it, making it the safer choice for "find the Nth distinct value" questions.
 
@@ -274,7 +274,7 @@ WHERE rn = 3;
 ```
 Numbers every user's transactions in date order without collapsing any rows; the outer query then filters to `rn = 3`, which by construction is each user's third transaction. Users with fewer than 3 transactions never produce an `rn = 3` row, so they're automatically excluded, no separate `HAVING COUNT >= 3` check needed, the filtering falls out of the numbering itself.
 
-### LAG and LEAD — looking at neighboring rows
+### LAG and LEAD: looking at neighboring rows
 ```sql
 LAG(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS previous_spend
 LEAD(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS next_spend
@@ -282,51 +282,6 @@ LEAD(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS next_spend
 `LAG` pulls the value from the previous row in the ordered partition; `LEAD` pulls it from the next row. The first row's `LAG` (and the last row's `LEAD`) has nothing to reference and returns NULL, unless a default is supplied as a second argument.
 
 This is the standard tool for "how did this compare to last time" questions, e.g. spend change transaction-to-transaction. It's a genuinely different comparison from the row-vs-group-average CTE pattern below: that pattern measures distance from a *fixed group baseline*, `LAG`/`LEAD` measure distance from the *adjacent row specifically*, which is awkward to express without a window function at all.
-
-**Mental model:** each row reaches sideways to grab a value from its neighbor — but "neighbor" only means something *within its partition, in the order specified*. Get either wrong and the row silently grabs the wrong neighbor, no error, just a plausible-looking wrong number.
-
-**Worked example.** Given:
-
-| user_id | transaction_date | spend |
-|---|---|---|
-| 1 | 01-01 | 50 |
-| 1 | 01-05 | 80 |
-| 1 | 01-10 | 30 |
-| 2 | 01-03 | 100 |
-| 2 | 01-08 | 60 |
-
-```sql
-LAG(spend) OVER (PARTITION BY user_id ORDER BY transaction_date) AS previous_spend
-```
-
-| user_id | transaction_date | spend | previous_spend |
-|---|---|---|---|
-| 1 | 01-01 | 50 | NULL |
-| 1 | 01-05 | 80 | 50 |
-| 1 | 01-10 | 30 | 80 |
-| 2 | 01-03 | 100 | NULL |
-| 2 | 01-08 | 60 | 100 |
-
-`PARTITION BY user_id` splits the table into independent sequences, one per user. `ORDER BY transaction_date` fixes the order within each. `LAG` steps backward one row inside that sequence; nothing ever crosses from user 1 into user 2. Each partition's first row has no predecessor, hence `NULL`.
-
-**Omitting `PARTITION BY` — the actual failure mode, not a hypothetical:**
-```sql
--- BROKEN: one global sequence ordered by date, user identity ignored
-LAG(spend) OVER (ORDER BY transaction_date) AS previous_spend
-```
-Same data, now one merged sequence across both users:
-
-| transaction_date | user_id | spend | previous_spend (broken) |
-|---|---|---|---|
-| 01-01 | 1 | 50 | NULL |
-| 01-03 | 2 | 100 | 50 ← user 1's spend |
-| 01-05 | 1 | 80 | 100 ← user 2's spend |
-| 01-08 | 2 | 60 | 80 ← user 1's spend |
-| 01-10 | 1 | 30 | 60 ← user 2's spend |
-
-Every row after the first now references another user's spend as its "previous" value. No error is thrown, the values just look plausible while being wrong.
-
-**Rule:** if the question is "compare this row to something about *this entity specifically*" (previous transaction, previous login, previous month), `PARTITION BY <entity>` is not optional styling, it's what defines which rows are even eligible to be each other's neighbor. `ORDER BY` inside `OVER` only answers the secondary question of sequence *within* that group — both have to be right independently. This is the same class of bug as using `LAG`/`LEAD` (or any ranking/window function) with `ORDER BY` alone and expecting it to also do the job of grouping by entity; it doesn't, `PARTITION BY` is the only clause that does that.
 
 ### Aggregates as window functions (running totals, group totals without collapsing)
 ```sql
@@ -413,7 +368,7 @@ CASE WHEN condition THEN value ELSE other_value END
 - Used inline in SELECT, ORDER BY, WHERE
 - Useful for conditional sorting, labeling, or categorization
 
-**CASE evaluates top-to-bottom and stops at the first match — same model as a JS `if / else if / else if` chain, not a set of independently-checked conditions.** A later `WHEN` can be completely unreachable if an earlier, broader condition already catches every row it would have matched:
+**CASE evaluates top-to-bottom and stops at the first match, same model as a JS `if / else if / else if` chain, not a set of independently-checked conditions.** A later `WHEN` can be completely unreachable if an earlier, broader condition already catches every row it would have matched:
 ```sql
 -- BROKEN: the third WHEN can never fire
 CASE 
@@ -444,10 +399,11 @@ FROM viewership;
 - `SUM()` over that flag counts how many rows matched
 - One pass over the table counts multiple buckets at once, instead of separate filtered queries per condition
 - Combine with GROUP BY to get the same breakdown per group (e.g. per date)
+- **Reserve this pattern for multi-bucket counting.** For a single condition, `WHERE` + `COUNT(*)` states the intent more directly and avoids the empty-set NULL behavior (see Aggregates Over an Empty Row Set below)
 
 **What goes inside THEN determines what's being aggregated.** `THEN 1` counts matching *rows* (occurrences). `THEN <column>` sums that column's actual *value* across matching rows. These give genuinely different numbers, e.g. "how many send events happened" (THEN 1) vs "how much total time was spent on send events" (THEN time_spent). Check the question's phrasing: "how many"/"count of"/"number of" → THEN 1; "total"/"sum of"/"amount of [quantity]" → THEN the actual column.
 
-### FILTER (WHERE...) — Postgres alternative to SUM(CASE WHEN...)
+### FILTER (WHERE...): Postgres alternative to SUM(CASE WHEN...)
 ```sql
 -- Equivalent to SUM(CASE WHEN activity_type = 'send' THEN time_spent ELSE 0 END)
 SUM(time_spent) FILTER (WHERE activity_type = 'send') AS send_time
@@ -466,7 +422,7 @@ SELECT account_id,
 FROM transactions
 GROUP BY account_id;
 ```
-Beats splitting into two CTEs (one per category) and JOINing them: single table scan instead of multiple, and GROUP BY naturally includes every entity with ANY matching row, avoiding the INNER-JOIN-drops-rows bug entirely (no join to have the bug in). Always include an explicit `ELSE` (e.g. `ELSE 0`) rather than relying on `ELSE -amount` to catch "everything else" — if a third category could exist in the data, that silently miscounts unexpected values instead of ignoring them. Use `SELECT DISTINCT` on the category column first if unsure how many categories actually exist.
+Beats splitting into two CTEs (one per category) and JOINing them: single table scan instead of multiple, and GROUP BY naturally includes every entity with ANY matching row, avoiding the INNER-JOIN-drops-rows bug entirely (no join to have the bug in). Always include an explicit `ELSE` (e.g. `ELSE 0`) rather than relying on `ELSE -amount` to catch "everything else", if a third category could exist in the data, that silently miscounts unexpected values instead of ignoring them. Use `SELECT DISTINCT` on the category column first if unsure how many categories actually exist.
 
 ### Weighted Mean
 ```sql
@@ -484,7 +440,7 @@ E.g. computing a mean from pre-aggregated/compressed data where each row represe
 ### COUNT(DISTINCT column)
 Counts distinct non-NULL values only. Avoids double-counting duplicate rows for the same entity (e.g. multiple log rows for the same query_id), and naturally gives 0 for an entity with no matching rows at all, e.g. after a LEFT JOIN with no match.
 
-### COUNT(CASE...) vs SUM(CASE...) — a silent trap
+### COUNT(CASE...) vs SUM(CASE...): a silent trap
 If the CASE has an `ELSE` that returns a real value (e.g. `ELSE 0`), **every** row produces a non-NULL result regardless of whether the condition matched. So:
 ```sql
 -- WRONG: silently returns the TOTAL ROW COUNT, not the count of matches
@@ -494,13 +450,34 @@ No error, just a wrong number, since COUNT counts non-NULLs and both branches of
 
 Two correct patterns:
 ```sql
--- (1) SUM the flags — correct WITH an ELSE present
+-- (1) SUM the flags, correct WITH an ELSE present
 SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END)
 
--- (2) COUNT with no ELSE — non-matches implicitly return NULL, COUNT skips them
+-- (2) COUNT with no ELSE, non-matches implicitly return NULL, COUNT skips them
 COUNT(CASE WHEN event_type = 'click' THEN 1 END)
 ```
 **Rule:** CASE with an ELSE returning a value → use SUM. CASE with no ELSE (implicit NULL fallthrough) → COUNT works. Never mix the two (COUNT with an ELSE that returns 0).
+
+### Aggregates Over an Empty Row Set: COUNT Returns 0, SUM Returns NULL
+```sql
+-- Zero rows survive the WHERE. What comes back?
+SELECT COUNT(*) AS n, SUM(salary) AS total_salary, MAX(salary) AS top_salary
+FROM employees
+WHERE EXTRACT(MONTH FROM hire_date) >= 13;   -- no month 13 exists
+-- n = 0, total_salary = NULL, top_salary = NULL
+```
+- Without GROUP BY, an aggregate always returns exactly **one** row, even when zero rows reach it.
+- `COUNT(*)` returns 0. `SUM`, `AVG`, `MIN`, `MAX` return NULL (nothing to add up, so "unknown", not an invented zero).
+- With GROUP BY, an empty input produces **zero rows**, not a row of NULLs, since there are no groups to report.
+- **Where the filter lives decides which outcome you get.** A condition inside `CASE` never empties the row set: non-matching rows still reach the aggregate and contribute the `ELSE` value (e.g. 0), so `SUM(CASE WHEN dept = 'Admin' THEN 1 ELSE 0 END)` returns 0 when rows exist but none are Admin. Only a `WHERE` (or `HAVING`) filter can remove every row before the aggregate runs, and then `SUM` returns NULL.
+- For a single-condition count, put the conditions in `WHERE` and use `COUNT(*)`: it returns 0 in both situations, regardless of which filter eliminated the rows. If `SUM` is genuinely needed, wrap it: `COALESCE(SUM(...), 0)`.
+- **Display trap:** a results grid may render NULL as a blank cell, which looks like "just the column header." To tell NULL apart from a display quirk, add `... IS NULL` to the SELECT list and check for `true`:
+```sql
+SELECT SUM(amount) IS NULL AS sum_is_null
+FROM payments
+WHERE status = 'no_such_status';
+```
+- Downstream arithmetic on that NULL stays NULL (`total + 1` is NULL), so it can silently propagate into later calculations.
 
 ### Integer Division Truncation
 Dividing an integer by an integer truncates to an integer in most dialects (`3 / 7` = `0`, not `0.428...`). `SUM(CASE WHEN...THEN 1 ELSE 0 END)` produces an integer, so dividing two such SUMs truncates silently, no error:
@@ -511,17 +488,17 @@ Dividing an integer by an integer truncates to an integer in most dialects (`3 /
 ```
 Fix by promoting to numeric/decimal **before** the division completes, via any one of:
 ```sql
--- (1) Decimal literal outside — the .0 promotes the whole expression
+-- (1) Decimal literal outside, the .0 promotes the whole expression
 100.0 * SUM(...) / SUM(...)
 
--- (2) Decimal literal inside the CASE — makes the SUM itself numeric
+-- (2) Decimal literal inside the CASE, makes the SUM itself numeric
 SUM(CASE WHEN event_type = 'click' THEN 1.0 ELSE 0 END) / SUM(...)
 
 -- (3) Explicit cast at the division point
 SUM(...)::NUMERIC / SUM(...)                    -- Postgres shorthand
 CAST(SUM(...) AS NUMERIC) / SUM(...)             -- standard
 ```
-Only **one** coercion point is needed; stacking multiple isn't wrong but signals uncertainty about which fix is actually load-bearing. Casting at the division point is more self-documenting for a reader who hasn't hit this bug before, since the fix sits visually next to the actual risk. Don't assume a reader will recognize a bare `1.0` literal as a truncation fix without already knowing this specific gotcha — write for the reader who hasn't hit it yet, not just for someone with identical background.
+Only **one** coercion point is needed; stacking multiple isn't wrong but signals uncertainty about which fix is actually load-bearing. Casting at the division point is more self-documenting for a reader who hasn't hit this bug before, since the fix sits visually next to the actual risk. Don't assume a reader will recognize a bare `1.0` literal as a truncation fix without already knowing this specific gotcha, write for the reader who hasn't hit it yet, not just for someone with identical background.
 
 See also ROUND's Two-Argument Postgres Error above, a related but distinct hard-error version of the same underlying "need numeric type" issue.
 
@@ -553,31 +530,17 @@ Date columns are numeric under the hood, which is why arithmetic works on them (
 - **SQL Server**: `DATEDIFF(day, earlier, later)`, unit argument first, order reversed vs MySQL.
 - **SQLite**: no native DATEDIFF, use `julianday(d1) - julianday(d2)`.
 
-### EXTRACT(DAY) is NOT Elapsed-Day Math — a common trap
+### EXTRACT(DAY) is NOT Elapsed-Day Math: a common trap
 `EXTRACT(DAY FROM date_col)` gives the day-of-month digit (1–31), **not** a running day count, it resets every month. Subtracting two `EXTRACT(DAY)` values only works if both dates fall in the same month, otherwise the arithmetic is meaningless:
 ```
 Feb 1 minus Jan 30: EXTRACT(DAY) gives 1 - 30 = -29, not the real 2-day gap
 ```
 `EXTRACT(YEAR)`/`EXTRACT(MONTH)` are fine as WHERE filters (checking which year/month a date falls in), but do not use `EXTRACT(DAY)` subtraction to compute elapsed time between two dates. Use `DATEDIFF` or direct date subtraction instead, those operate on the actual underlying date value, not an extracted piece of it.
 
-**Generalized trap: `EXTRACT(part)` discards every component coarser than `part`, and equating on it alone silently ignores that discarded context.** `EXTRACT(DAY ...)` above is one instance; the same failure happens one level up with `EXTRACT(MONTH ...)`:
-```sql
--- BROKEN: matches "same month, any year" — June 2021 satisfies this against July 2022
-WHERE EXTRACT(MONTH FROM last_month.event_date) =
-      EXTRACT(MONTH FROM curr_month.event_date - INTERVAL '1 month')
-```
-This compares only the month digit (1–12); the year is never checked. On a dataset that happens to contain only one year of data it produces correct-looking output, since there's nothing else for it to accidentally match against, but the query itself doesn't express "the immediately preceding month," it expresses "same calendar month, any year." **Rule: whenever a comparison is meant to identify one specific point in time (not just a recurring calendar position like "always December"), compare full date/timestamp values or truncated date values, never a single extracted component in isolation.** Use `DATE_TRUNC('month', date_col)` or direct date/interval subtraction instead:
-```sql
--- CORRECT: compares full year-month values, not a bare digit
-WHERE DATE_TRUNC('month', last_month.event_date) =
-      DATE_TRUNC('month', curr_month.event_date) - INTERVAL '1 month'
-```
-`EXTRACT()` remains the right tool for genuinely recurring calendar-position filters (e.g. "every December regardless of year"), just not for "the month immediately before this one," which is a point-in-time comparison, not a calendar-position one.
-
 ### ::date Cast (Postgres shorthand for CAST(col AS DATE))
 Strips the time component from a `TIMESTAMP`, leaving just the calendar date. Needed when comparing "did X happen exactly N days after Y" using timestamp columns, since raw subtraction can carry a fractional-day remainder from the time-of-day portion (e.g. signup at 11pm, confirmation at 1am the next day, is only ~2 hours apart, not a clean 1-day gap), which can throw off an exact day-count match. Cast both sides to date first when the question is about calendar-day differences, not exact elapsed time.
 
-### DATE()/::date/CAST(AS DATE) vs EXTRACT(DAY) — grouping or partitioning by calendar day
+### DATE()/::date/CAST(AS DATE) vs EXTRACT(DAY): grouping or partitioning by calendar day
 A second, distinct instance of the same underlying `EXTRACT(DAY)` trap above, this time in `GROUP BY`/`PARTITION BY` rather than elapsed-time subtraction. `EXTRACT(DAY FROM ts)` returns only the day-of-month digit (1–31), discarding month and year, so `2024-01-15` and `2024-02-15` both extract to `15` and get treated as the same group, silently merging unrelated calendar days that happen to share a day-of-month number.
 
 `DATE(ts)`, `ts::DATE` (Postgres shorthand), and `CAST(ts AS DATE)` (ANSI-standard, portable) all do the opposite: they truncate a timestamp down to its full calendar date, keeping year, month, and day together, only dropping the time-of-day. That's what "group by day" or "rank within each day" almost always means.
@@ -600,7 +563,20 @@ Rule of thumb: `EXTRACT()` pulls a single numeric component out of a date and ne
 
 Check which SQL dialect is in use before reaching for `DATEDIFF`/`YEAR` (MySQL) vs `EXTRACT` (Postgres), since syntax varies by target engine.
 
-### Dialect-agnostic range filter (preferred when possible)
+### Month-of-year vs point-in-time: match the tool to the question
+```sql
+-- "Joined in April or later, in ANY year": month-of-year question
+WHERE EXTRACT(MONTH FROM joining_date) >= 4
+
+-- "Joined on or after 1 April 2024": point-in-time question
+WHERE joining_date >= '2024-04-01'
+```
+- `EXTRACT(MONTH ...)` is the **correct** tool when the question is about the month regardless of year (seasonality, "any year"). A date range cannot express that.
+- A full-date range comparison is the correct tool when the question is about a specific point in time. `EXTRACT(MONTH)` alone discards the year, so March 2025 fails `>= 4` even though it is later than April 2024.
+- Same function, opposite verdict depending on what the question actually means. This is the same family as the `EXTRACT(DAY)` trap above: extracting one component throws away the rest of the date, which is a bug when the rest matters and the right behavior when it does not.
+- Read the question for "any year" / "each year" / a named year before choosing.
+
+### Dialect-agnostic range filter (preferred for point-in-time questions)
 ```sql
 WHERE date_col >= '2022-08-01' AND date_col < '2022-09-01'
 ```
@@ -700,9 +676,9 @@ SELECT * FROM step2;
 
 A subquery is a SELECT inside another SELECT. The inner query runs first, its result is used by the outer query. Subqueries can appear almost anywhere, not just WHERE:
 
-- **SELECT list (scalar subquery)** — must return exactly one value per outer row. Only correlated to the outer query if it explicitly references an outer column; otherwise it runs independently.
-- **FROM (derived table)** — acts as a temporary table.
-- **HAVING** — same rules as WHERE.
+- **SELECT list (scalar subquery)**, must return exactly one value per outer row. Only correlated to the outer query if it explicitly references an outer column; otherwise it runs independently.
+- **FROM (derived table)**, acts as a temporary table.
+- **HAVING**, same rules as WHERE.
 
 ### 1. Subquery in WHERE with IN (list of values)
 ```sql
@@ -737,7 +713,7 @@ WHERE products.price > (
 ```
 Inner query references `products.product_id` from the outer query, running once per product row (slow on large tables). Must use an aggregate if multiple rows could match, otherwise SQLite may run silently with unreliable results (PostgreSQL/SQL Server would throw an error). Usually replaceable with a JOIN.
 
-### 4. Broadcasting a single aggregate value to every row — scalar subquery vs CROSS JOIN
+### 4. Broadcasting a single aggregate value to every row: scalar subquery vs CROSS JOIN
 ```sql
 -- Scalar subquery inside CASE, re-evaluated conceptually per row
 SELECT CASE WHEN order_id = (SELECT COUNT(order_id) FROM orders) THEN ... END
@@ -785,6 +761,15 @@ ORDER BY
   CASE WHEN orders.order_status = 'cancelled' THEN 1 ELSE 0 END,
   ABS(difference) DESC;
 ```
+
+### Count rows matching several conditions (single total)
+```sql
+SELECT COUNT(*) AS admin_april_or_later_count
+FROM worker
+WHERE department = 'Admin'
+  AND EXTRACT(MONTH FROM joining_date) >= 4;
+```
+Both conditions are row-level filters, so both belong in `WHERE`, with `COUNT(*)` on top. Returns 0 (not NULL) even if no row qualifies. The `SUM(CASE WHEN ...)` version works on typical data but returns NULL when the `WHERE` empties the row set, and it is the wrong tool for a single condition (see Aggregates Over an Empty Row Set).
 
 ### Find records below a threshold
 ```sql
@@ -841,7 +826,7 @@ FROM (
     HAVING COUNT(*) > 1
 ) duplicated_listings;
 ```
-GROUP BY the columns that define "duplicate", then HAVING COUNT(*) > 1. **Don't reach for a self-join here** — it creates unnecessary row-multiplication and is easy to get wrong. GROUP BY + HAVING COUNT(*) > 1 is simpler, faster, and directly matches the actual question ("does more than one of this combination exist").
+GROUP BY the columns that define "duplicate", then HAVING COUNT(*) > 1. **Don't reach for a self-join here**, it creates unnecessary row-multiplication and is easy to get wrong. GROUP BY + HAVING COUNT(*) > 1 is simpler, faster, and directly matches the actual question ("does more than one of this combination exist").
 
 Note: this finds and counts duplicate *groups*, but collapses rows. If the actual need is to see the individual duplicate rows themselves, not just confirm duplicates exist, that needs a window function (`ROW_NUMBER() OVER (PARTITION BY <duplicate-defining columns>)`, then filter `WHERE rn > 1`) or a self-join back to the grouped result, since row-level detail is required there.
 
@@ -919,7 +904,7 @@ WHERE post_date >= '2021-01-01' AND post_date < '2022-01-01'
 GROUP BY user_id
 HAVING COUNT(*) >= 2;
 ```
-`HAVING COUNT(*) >= 2` excludes single-event groups where the gap is meaningless. No subquery needed, this is a GROUP BY + aggregate problem. Filter on the actual stated condition (row count), not a proxy that happens to correlate on current sample data — e.g. `days_between > 0` is NOT equivalent to `COUNT(*) >= 2`, it breaks silently on duplicate-date rows.
+`HAVING COUNT(*) >= 2` excludes single-event groups where the gap is meaningless. No subquery needed, this is a GROUP BY + aggregate problem. Filter on the actual stated condition (row count), not a proxy that happens to correlate on current sample data, e.g. `days_between > 0` is NOT equivalent to `COUNT(*) >= 2`, it breaks silently on duplicate-date rows.
 
 ### Exact N-day gap between two related events
 E.g. confirmation exactly 1 day after signup. Join the two events (e.g. via a shared id), use `DATEDIFF` or date subtraction on the actual date columns, never `EXTRACT(DAY)` subtraction (see the trap above). Cast to `::date` first if columns are timestamps and the question means calendar days, not exact elapsed time.
@@ -939,7 +924,7 @@ SELECT sessions.user_id,
 FROM sessions
 LEFT JOIN average ON sessions.user_id = average.user_id;
 ```
-Example: each login's distance from that user's average login date. Needed whenever the output must stay at row-level granularity while comparing against a group-level aggregate — GROUP BY alone collapses rows and can't do this, so use a CTE/subquery to compute the per-group baseline, then JOIN back to the row-level table. (A windowed aggregate, e.g. `AVG(...) OVER (PARTITION BY user_id)`, can also solve this shape in one pass, see Window Functions above.)
+Example: each login's distance from that user's average login date. Needed whenever the output must stay at row-level granularity while comparing against a group-level aggregate, GROUP BY alone collapses rows and can't do this, so use a CTE/subquery to compute the per-group baseline, then JOIN back to the row-level table. (A windowed aggregate, e.g. `AVG(...) OVER (PARTITION BY user_id)`, can also solve this shape in one pass, see Window Functions above.)
 
 **Verification trick:** deviations from an average should sum to approximately 0 (mathematical property of the mean). Sum the deviation column per group as a sanity check on the average calculation; small non-zero sums (e.g. off by 1) are expected rounding/truncation error, not a bug.
 
@@ -982,7 +967,7 @@ GROUP BY sender_id
 ORDER BY message_count DESC
 LIMIT 2;
 ```
-`ORDER BY ... LIMIT N` only works safely if no ties are expected in the data. If ties are possible and must be handled correctly, use `RANK()` or `DENSE_RANK()` instead (see Window Functions above) — `LIMIT` arbitrarily picks one of the tied rows with no guaranteed stability, while `RANK`/`DENSE_RANK` make the tie explicit in the output.
+`ORDER BY ... LIMIT N` only works safely if no ties are expected in the data. If ties are possible and must be handled correctly, use `RANK()` or `DENSE_RANK()` instead (see Window Functions above), `LIMIT` arbitrarily picks one of the tied rows with no guaranteed stability, while `RANK`/`DENSE_RANK` make the tie explicit in the output.
 
 ---
 
@@ -1006,7 +991,7 @@ WHERE (status = 'completed' OR status = 'shipped')
 - Always use brackets when mixing AND and OR in the same WHERE clause
 - If a query returns unexpected results, check your AND/OR grouping first
 
-**Real case study — a date filter silently bypassed:**
+**Real case study, a date filter silently bypassed:**
 ```sql
 -- BROKEN: the date range only applies to the rn = 1 branch
 WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND rnk = 1 OR rnk = 2
@@ -1024,7 +1009,7 @@ WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND (
 WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND rnk IN (1, 2)
 ```
 
-**IN vs the AND/OR precedence trap — what IN actually replaces.** `column IN (val1, val2, ...)` is a single self-contained condition, equivalent to `column = val1 OR column = val2 OR ...` collapsed into one. It combines freely with `AND`, with no precedence risk, e.g. `date >= x AND date < y AND status IN ('open', 'pending')` needs no brackets. **This is not because `IN` has a special relationship with `AND`.** The precedence danger is specifically about a literal `OR` sitting in the same WHERE clause as an `AND`; `IN` sidesteps it only because it removes the `OR` from the query entirely by expressing the "any of these values" logic as one condition instead of several OR'd ones. When several OR'd equality checks against the *same column* are mixed with AND, prefer `IN` over manual OR + brackets, both work, but `IN` removes the ambiguity source rather than just working around it.
+**IN vs the AND/OR precedence trap, what IN actually replaces.** `column IN (val1, val2, ...)` is a single self-contained condition, equivalent to `column = val1 OR column = val2 OR ...` collapsed into one. It combines freely with `AND`, with no precedence risk, e.g. `date >= x AND date < y AND status IN ('open', 'pending')` needs no brackets. **This is not because `IN` has a special relationship with `AND`.** The precedence danger is specifically about a literal `OR` sitting in the same WHERE clause as an `AND`; `IN` sidesteps it only because it removes the `OR` from the query entirely by expressing the "any of these values" logic as one condition instead of several OR'd ones. When several OR'd equality checks against the *same column* are mixed with AND, prefer `IN` over manual OR + brackets, both work, but `IN` removes the ambiguity source rather than just working around it.
 
 ---
 
@@ -1054,3 +1039,6 @@ WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND r
 - Use `ROW_NUMBER`, never `RANK`/`DENSE_RANK`, whenever the number itself will be used as a unique positional index downstream (pagination, odd/even bucketing, "assign each row a distinct slot"); reserve `RANK`/`DENSE_RANK` for when ties should genuinely be reported as tied
 - Write `CASE` conditions to be mutually exclusive where possible, rather than relying on top-to-bottom evaluation order for correctness; where an exception must be checked against a broader catch-all condition, the exception goes first, since CASE stops at the first match, same as a JS if/else-if chain
 - When a single aggregate value needs to be available to every row of a per-row calculation, default to `CROSS JOIN` with a single-row CTE over a scalar subquery, it's computed explicitly once rather than relying on the optimizer to recognize a non-correlated subquery
+- For a single-condition count, put every condition in `WHERE` and use `COUNT(*)`; reserve `SUM(CASE WHEN...)` for multi-bucket pivots, and wrap `SUM` in `COALESCE(..., 0)` when a NULL on an empty row set would be wrong
+- When a results grid shows a blank cell, add `... IS NULL` to the SELECT list to distinguish NULL from a display quirk before drawing conclusions
+- Choose between `EXTRACT(MONTH ...)` and a date range by what the question means: month-of-year regardless of year, versus a specific point in time
