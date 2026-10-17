@@ -22,7 +22,7 @@ This explains why:
 SELECT column1, column2, expression AS alias
 FROM table;
 ```
-- `*` returns all columns (avoid in production queries, be explicit)
+- `*` returns all columns (avoid in production queries, be explicit). Exception: when the spec explicitly asks for all columns, `*` is the faithful translation, not a style violation
 - No way to exclude specific columns in standard SQL (no `SELECT * EXCEPT`)
 - Aliases are for display and ORDER BY only, not for WHERE/HAVING
 - Always alias aggregate outputs explicitly (e.g. `SUM(amount) AS deposit_total`), never rely on the engine's implicit default column name (e.g. bare `sum`); it's ambiguous and dialect-dependent
@@ -121,6 +121,34 @@ Use the underscore version when the pattern is short. Switch to `LENGTH()` when 
    ```
 
 6. **Fixed-length CHAR columns.** Padding behaviour for `CHAR(n)` differs between dialects and can break fixed-length patterns. If counts look off, test with `LENGTH(col)` or `TRIM(col)`.
+
+#### Match the wildcard placement to the wording of the question
+
+| Wording | Pattern |
+|---|---|
+| starts with X | `'X%'` (no leading `%`) |
+| ends with X | `'%X'` |
+| contains / includes X anywhere | `'%X%'` |
+
+A leading `%` on a "starts with" question silently returns extra rows (e.g. `'%draft%'` also matches `final_draft`). No error, just a wrong result set.
+
+#### Trap: padding with spaces to simulate "whole word"
+
+```sql
+-- WRONG for "contains the word": needs a physical space on BOTH sides
+WHERE contents ILIKE '% optimism %'
+```
+
+This silently misses "Optimism is key" (start of string), "we need optimism." (punctuation), "optimism, he said" (comma), and any case where a newline or tab sits next to the word. No error, the query just loses rows. Only use this if the question genuinely demands a whole-word match, and even then use a real word boundary:
+
+```sql
+-- Postgres regex, case-insensitive, \y = word boundary
+WHERE contents ~* '\yoptimism\y'
+```
+
+[FACT] `~*` and `\y` are Postgres-only. Other engines use different boundary syntax (MySQL uses `REGEXP` with its own boundary token).
+
+**Substring vs whole-word is a spec decision, not a style choice.** "Includes X anywhere within it" is a substring requirement: `'%X%'` is the complete answer, and a word boundary would wrongly exclude hits like "optimisms".
 
 #### Performance
 
@@ -1129,3 +1157,4 @@ WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND r
 - For a single-condition count, put every condition in `WHERE` and use `COUNT(*)`; reserve `SUM(CASE WHEN...)` for multi-bucket pivots, and wrap `SUM` in `COALESCE(..., 0)` when a NULL on an empty row set would be wrong
 - When a results grid shows a blank cell, add `... IS NULL` to the SELECT list to distinguish NULL from a display quirk before drawing conclusions
 - Choose between `EXTRACT(MONTH ...)` and a date range by what the question means: month-of-year regardless of year, versus a specific point in time
+- Before writing a query, underline the exact verbs and quantities in the question ("starts with", "contains", "anywhere", "all columns", "distinct", "per group") and map each one to a specific clause or pattern. Most wrong answers on simple questions are spec-reading gaps, not SQL gaps
