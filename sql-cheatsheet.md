@@ -552,6 +552,13 @@ E.g. computing a mean from pre-aggregated/compressed data where each row represe
 - Only identical if the column can never be NULL
 - Default to `COUNT(*)` unless specifically counting non-null occurrences of one column; `COUNT(column)` silently undercounts if that column can contain NULLs
 
+### Don't filter NOT NULL in WHERE and then COUNT(column)
+`WHERE col IS NOT NULL` combined with `COUNT(col)` does the same job twice. Pick one place for the NULL logic:
+- Filter in WHERE and use `COUNT(*)`: groups with no qualifying rows disappear from the output
+- Filter nowhere and use `COUNT(col)`: every group stays, and groups with no qualifying rows show 0
+
+The placement changes the output when a question says "for each X" and some X values have zero qualifying rows. Decide which behavior the question wants before choosing.
+
 ### COUNT(DISTINCT column)
 Counts distinct non-NULL values only. Avoids double-counting duplicate rows for the same entity (e.g. multiple log rows for the same query_id), and naturally gives 0 for an entity with no matching rows at all, e.g. after a LEFT JOIN with no match.
 
@@ -572,6 +579,17 @@ SUM(CASE WHEN event_type = 'click' THEN 1 ELSE 0 END)
 COUNT(CASE WHEN event_type = 'click' THEN 1 END)
 ```
 **Rule:** CASE with an ELSE returning a value → use SUM. CASE with no ELSE (implicit NULL fallthrough) → COUNT works. Never mix the two (COUNT with an ELSE that returns 0).
+
+### NULLs inside a group vs an empty row set: two different situations
+Two separate questions get mixed up here, and they have different answers.
+
+**Question 1: what happens to NULL values inside a group that has rows?**
+Every aggregate except `COUNT(*)` skips them: `COUNT(column)`, `SUM`, `AVG`, `MIN` and `MAX` all ignore NULLs. Only `COUNT(*)` counts the row regardless.
+
+**Question 2: what happens when no rows (or only NULLs) are left to aggregate?**
+This is where the aggregates differ: `COUNT` returns 0, while `SUM`, `AVG`, `MIN` and `MAX` return NULL.
+
+Mistaken model to avoid: "COUNT ignores empty values but SUM doesn't." Both ignore them. The only difference is what they return when nothing is left.
 
 ### Aggregates Over an Empty Row Set: COUNT Returns 0, SUM Returns NULL
 ```sql
@@ -720,6 +738,20 @@ WHERE payments.payment_id != NULL
 - Any comparison against NULL (=, !=, >, <) returns NULL, not TRUE/FALSE
 - WHERE only includes rows where the condition is TRUE, so NULL comparisons silently exclude rows
 - LEFT JOIN + IS NULL is the standard pattern for finding missing related records
+
+### "Blank" can mean NULL or an empty string
+These are different values and need different checks:
+- `col IS NULL` catches missing values only
+- `col = ''` catches empty strings only
+- `IS NOT NULL` and `COUNT(col)` both treat `''` as a real value, so empty strings pass straight through
+
+When a problem says a column is "empty" or "will contain a value only if...", check which one the data uses before filtering:
+```sql
+SELECT COUNT(*) FILTER (WHERE col IS NULL) AS null_rows,
+       COUNT(*) FILTER (WHERE col = '')    AS empty_string_rows
+FROM table_name;
+```
+Portable version: replace each `FILTER` with `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`.
 
 ### COALESCE(value, fallback)
 Returns the first non-NULL argument in the list:
