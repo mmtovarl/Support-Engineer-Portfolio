@@ -316,6 +316,40 @@ ORDER BY                                      -- deprioritize cancelled orders
 - Multiple conditions: comma-separated, evaluated left to right
 - Use it as a standing habit even when not strictly required by a question, to keep the syntax and clause ordering from becoming a lookup-every-time item
 
+### NULL sort position: decide it, don't inherit it
+**Mental model:** every engine silently decides whether NULL counts as "bigger than everything" or "smaller than everything", and `DESC` just flips the list. Whichever the engine picked decides which end of your sort the NULLs land on.
+
+| Engine | NULL is treated as | `ASC` puts NULLs | `DESC` puts NULLs | `NULLS FIRST` / `NULLS LAST` |
+|---|---|---|---|---|
+| PostgreSQL | larger than any value | last | **first** | supported |
+| Oracle | larger than any value | last | **first** | supported |
+| MySQL | smaller than any value | first | last | not supported (syntax error) |
+| SQL Server | smaller than any value | first | last | not supported (syntax error) |
+| SQLite | smaller than any value | first | last | supported from 3.30 |
+
+**Why it matters for "most / highest / top N":** in Postgres and Oracle, `ORDER BY col DESC` (or a window `ORDER BY col DESC`) ranks a NULL row first. If the query then keeps only `rn = 1` and selects only a name column, the NULL-profit row can win and nothing in the output reveals it: a plausible-looking name, no error. A rule like "I'll add `NULLS LAST` when I see NULLs at the top" fails exactly here, because rank-1-only output hides the problem.
+
+**The trigger is a question, not a keyword.** Before any `ORDER BY` or window `ORDER BY`, ask: *can this column be NULL, and should a NULL be allowed to win?*
+- Nullable, and NULL should not win (top-N, "most", "highest"): handle it explicitly.
+- Nullable, and NULLs are the point (data-quality check, "which rows are missing a value"): `NULLS FIRST` on purpose.
+- Column is `NOT NULL`: nothing needed. Adding the keyword is harmless noise.
+- `NULLS LAST` only changes anything on `DESC` in Postgres/Oracle, since `ASC` already puts NULLs last there.
+
+```sql
+-- Postgres / Oracle / SQLite 3.30+: explicit, compact
+ORDER BY profits DESC NULLS LAST
+RANK() OVER (ORDER BY profits DESC NULLS LAST)   -- goes inside OVER for ranking
+
+-- Portable (every engine): remove NULLs from the ranking entirely
+WHERE profits IS NOT NULL
+
+-- Portable (every engine): keep NULL rows in the output but push them down
+ORDER BY CASE WHEN profits IS NULL THEN 1 ELSE 0 END, profits DESC
+```
+- `WHERE col IS NOT NULL` states the intent in the query and travels across dialects, but it also removes those rows from the result. Use the `CASE` sort when NULL rows must still appear.
+- For Postgres-only work, `DESC NULLS LAST` is a good default on ranking a nullable column, as long as it comes from asking the question above and not from reflex. If the target engine might be MySQL or SQL Server, use the `IS NOT NULL` filter or the `CASE` sort, since `NULLS LAST` is a syntax error there.
+- See also the window `ORDER BY` rules under Window Functions: the NULL placement belongs inside `OVER (...)` for ranking, and in the outer `ORDER BY` for display order.
+
 ---
 
 ## Window Functions
@@ -1106,6 +1140,25 @@ ORDER BY d.department_name ASC, s.salary DESC, s.name ASC;
 ```
 Ranking (and any GROUP BY, if aggregating first) happens against the primary table alone; the lookup table is only joined afterward, against the rows that survived the rank filter, rather than being carried through every row from the start (see join-late-vs-join-early note under JOIN Types above). Both this ordering and joining-then-ranking are usually correct, but this is the better default habit. Keep the window's `ORDER BY` limited to the column(s) that should actually determine ties (here, just `salary`), never add a uniquely-valued tiebreaker column (like `name`) inside `OVER (...)`, that silently breaks legitimate ties (see ORDER BY inside OVER() trap above). Any display-only sort order (like sorting by name within a rank) belongs in the outer query's `ORDER BY`, not inside the window function. Use a range comparison (`<= 3`) rather than `IN (1,2,3)` for a "top N" filter, see IN vs Comparison Operators above.
 
+### Single most/least X within a category (filter first, then rank)
+```sql
+-- "Most profitable company in the financial sector, with its continent"
+SELECT company, continent
+FROM (
+    SELECT company,
+           continent,
+           RANK() OVER (ORDER BY profits DESC NULLS LAST) AS profit_rank
+    FROM forbes_global_2010_2014
+    WHERE sector = 'Financials'
+) AS ranked_financials
+WHERE profit_rank = 1;
+```
+- The category phrase in the question ("from the financial sector") is a row filter, so it goes in `WHERE` **inside** the subquery, before the ranking runs. Filtering after ranking would rank the whole table and then keep only the winner's sector, which answers a different question.
+- Check the exact category spelling first: `SELECT DISTINCT sector FROM forbes_global_2010_2014;`
+- `RANK()` returns every company tied at the top, which is the honest answer to "the most profitable". `ROW_NUMBER()` would silently return one arbitrary row of a tie.
+- `NULLS LAST` (Postgres) keeps a NULL-profit company from taking rank 1, see NULL sort position under ORDER BY.
+- For one single best value with no ranking needed, `ORDER BY profits DESC NULLS LAST LIMIT 1` is shorter but has the tie problem. `WHERE sector = 'Financials' AND profits = (SELECT MAX(profits) FROM ... WHERE sector = 'Financials')` returns ties without a window function.
+
 ### Top N per group ranking, with ties (simple, non-aggregated case)
 ```sql
 SELECT sender_id, COUNT(*) AS message_count
@@ -1160,6 +1213,33 @@ WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND r
 
 ---
 
+## Verifying a Query: Accepted Is Not the Same as Correct
+
+An automated checker only compares your output with the expected output on **one fixed dataset**. It does not check that your logic matches the question. A query can pass with a required filter missing, a tie handled by luck, or a NULL that never happened to sort first.
+
+**Worked case:** a question asked for the most profitable company *from the financial sector*. A query with no sector filter at all was accepted. The reason: the top-profit company overall was also a financial company, so the filtered and unfiltered queries returned the same row. The data could not tell the two queries apart.
+
+How to catch this yourself:
+1. **Map every phrase of the question to a clause before submitting.** A category ("from the financial sector"), a date range, a status, a "per group": each one should have a visible `WHERE`, `GROUP BY` or `PARTITION BY`. A phrase with no matching clause is a missing filter until proven otherwise.
+2. **Probe the data for what could have masked a bug.** Run an unfiltered top-N and look at the columns you filtered on:
+```sql
+SELECT company, continent, sector, profits
+FROM forbes_global_2010_2014
+ORDER BY profits DESC NULLS LAST
+LIMIT 5;
+```
+If row 1 belongs to the category, the filter was not exercised by this data. If it does not, the unfiltered query should have failed, so something else (a lenient checker) needs explaining. Ties in this output (two rows with the same value) also show that tie handling can matter on this data.
+3. **Count the NULLs in any column you sort or rank on**, since a `NULLS LAST` probe hides them by design:
+```sql
+SELECT COUNT(*) AS null_profit_rows
+FROM forbes_global_2010_2014
+WHERE profits IS NULL;
+```
+A result of 0 means a missing `NULLS LAST` was safe on this dataset only, not in general.
+4. **Treat "it passed" as evidence about the output, not about the query.** Defensive habits (explicit filters, `RANK` over `ROW_NUMBER`, explicit NULL handling) cost almost nothing and keep the query correct when the data changes.
+
+---
+
 ## Style Rules
 - Always use `table.column` notation in multi-table queries
 - Use brackets around expressions for clarity: `(quantity_on_hand - quantity_reserved) < 5`
@@ -1190,3 +1270,6 @@ WHERE transaction_date >= '2022-01-01' AND transaction_date < '2023-01-01' AND r
 - When a results grid shows a blank cell, add `... IS NULL` to the SELECT list to distinguish NULL from a display quirk before drawing conclusions
 - Choose between `EXTRACT(MONTH ...)` and a date range by what the question means: month-of-year regardless of year, versus a specific point in time
 - Before writing a query, underline the exact verbs and quantities in the question ("starts with", "contains", "anywhere", "all columns", "distinct", "per group") and map each one to a specific clause or pattern. Most wrong answers on simple questions are spec-reading gaps, not SQL gaps
+- Every filter phrase in the question ("from the financial sector", "in 2022", "completed orders") must map to a visible `WHERE` clause. An accepted answer does not prove the filter is unnecessary, since the test data may simply not exercise it
+- Before sorting or ranking a nullable column, decide what NULLs should do. Don't rely on spotting NULLs in the output, since a rank-1-only query hides them. Postgres/Oracle: `DESC` puts NULLs first, use `NULLS LAST` or `IS NOT NULL`. MySQL/SQL Server: `DESC` already puts NULLs last and `NULLS LAST` is a syntax error. Portable option: `IS NOT NULL` filter or a `CASE` sort
+- Treat "accepted" as evidence about the output on one dataset, not proof the query is right: probe with an unfiltered top-N, check ties, count NULLs
