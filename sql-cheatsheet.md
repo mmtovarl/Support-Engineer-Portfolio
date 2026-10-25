@@ -552,6 +552,13 @@ FROM viewership;
 
 **What goes inside THEN determines what's being aggregated.** `THEN 1` counts matching *rows* (occurrences). `THEN <column>` sums that column's actual *value* across matching rows. These give genuinely different numbers, e.g. "how many send events happened" (THEN 1) vs "how much total time was spent on send events" (THEN time_spent). Check the question's phrasing: "how many"/"count of"/"number of" → THEN 1; "total"/"sum of"/"amount of [quantity]" → THEN the actual column.
 
+### Ratio of matching rows: AVG over a 0/1 flag
+```sql
+SELECT AVG(CASE WHEN phone_number IS NULL THEN 1.0 ELSE 0 END) AS null_phone_ratio
+FROM employees;
+```
+The average of a 0/1 flag is the proportion of rows where the flag is 1, so no second aggregate and no cast are needed. The `1.0` makes the result numeric, avoiding integer truncation. **This is the one place `ELSE 0` is required**, because every row must contribute to the denominator. It is the opposite of the `COUNT(CASE...)` rule, where an `ELSE` breaks the count. An empty table returns NULL (no error), unlike the two-aggregate division, which errors on divide-by-zero (see NULLIF under NULL Handling).
+
 ### FILTER (WHERE...): Postgres alternative to SUM(CASE WHEN...)
 ```sql
 -- Equivalent to SUM(CASE WHEN activity_type = 'send' THEN time_spent ELSE 0 END)
@@ -585,6 +592,7 @@ E.g. computing a mean from pre-aggregated/compressed data where each row represe
 - `COUNT(column)` counts only non-NULL values in that column
 - Only identical if the column can never be NULL
 - Default to `COUNT(*)` unless specifically counting non-null occurrences of one column; `COUNT(column)` silently undercounts if that column can contain NULLs
+- `COUNT(*) - COUNT(column)` gives the number of NULLs in `column` directly, with no CASE needed
 
 ### Don't filter NOT NULL in WHERE and then COUNT(column)
 `WHERE col IS NOT NULL` combined with `COUNT(col)` does the same job twice. Pick one place for the NULL logic:
@@ -793,6 +801,12 @@ Returns the first non-NULL argument in the list:
 COALESCE(deposit.deposit_total, 0) - COALESCE(withdrawal.withdrawal_total, 0)
 ```
 Use to substitute a default when a value could be NULL from a join's unmatched side (e.g. after a FULL OUTER JOIN). Without it, `NULL - 5` or `5 - NULL` evaluates to NULL for the whole expression, silently losing an otherwise fully-knowable row.
+
+### NULLIF(value, comparison): the divide-by-zero guard
+```sql
+SUM(a)::NUMERIC / NULLIF(COUNT(*), 0)
+```
+`NULLIF(x, y)` returns NULL if `x = y`, otherwise `x`. Dividing by NULL gives NULL instead of a hard "division by zero" error. Use it on any denominator that could be 0 on an empty or heavily filtered slice. If a 0 should display instead of NULL, wrap the whole expression in `COALESCE(..., 0)`, but only when "no data" and "zero" mean the same thing for the reader.
 
 ---
 
