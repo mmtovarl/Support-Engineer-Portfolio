@@ -781,19 +781,46 @@ WHERE payments.payment_id != NULL
 - WHERE only includes rows where the condition is TRUE, so NULL comparisons silently exclude rows
 - LEFT JOIN + IS NULL is the standard pattern for finding missing related records
 
-### "Blank" can mean NULL or an empty string
-These are different values and need different checks:
+### "Blank" can mean NULL, an empty string, or whitespace
+These are three different values and need different checks:
 - `col IS NULL` catches missing values only
 - `col = ''` catches empty strings only
-- `IS NOT NULL` and `COUNT(col)` both treat `''` as a real value, so empty strings pass straight through
+- `TRIM(col) = ''` catches empty strings AND whitespace-only values like `'   '`
+- `IS NOT NULL` and `COUNT(col)` treat `''` and `' '` as real values, so they pass straight through
 
-When a problem says a column is "empty" or "will contain a value only if...", check which one the data uses before filtering:
+When a problem says a column is "empty", "missing" or "not provided", check how the data actually encodes it before filtering. Probe the distribution of cleaned lengths in one pass:
 ```sql
-SELECT COUNT(*) FILTER (WHERE col IS NULL) AS null_rows,
-       COUNT(*) FILTER (WHERE col = '')    AS empty_string_rows
-FROM table_name;
+SELECT LENGTH(TRIM(phone_number)) AS len, COUNT(*) AS n
+FROM fintech_app_users
+GROUP BY LENGTH(TRIM(phone_number))
+ORDER BY len;
 ```
-Portable version: replace each `FILTER` with `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`.
+
+**How to read it**
+- Nested functions evaluate inside out: `LENGTH(TRIM(col))` means "clean the value first, then measure it"
+- `TRIM` removes leading and trailing spaces only, not spaces in the middle
+- A whitespace-only value has a raw `LENGTH` above 0, so it looks like real data until `TRIM` reduces it to `''`
+- `len = 0` means empty string or whitespace-only
+- A NULL input gives a NULL length, so missing values form their own group (blank in the results grid, sorted last on `ASC` in Postgres). Add `col IS NULL` to the SELECT list to confirm
+- Short lengths reveal placeholders: `'N/A'` is 3, `'null'` is 4, `'0'` is 1
+- Use `COUNT(*)`, not `COUNT(col)`, so the NULL group is counted
+- Repeat the full expression in `GROUP BY` rather than the alias (portable)
+- This is two-level aggregation in miniature: compute a per-row number, then group by that number
+
+**Decide from the output**
+- Only NULLs found: `WHERE col IS NULL` is correct, and a `TRIM` branch would be dead logic on that data
+- Empty or whitespace values found: `WHERE col IS NULL OR TRIM(col) = ''`
+- "Dead logic" is a statement about the data you probed, not the column's rules. For a fixed practice dataset the probe settles it. For a live system, check for a constraint or ask the schema owner, because the column may allow other blanks later
+
+**Limits of the probe**
+- Length cannot catch a junk value of plausible length such as `'0000000000'`. Look at the distinct values themselves
+- Placeholders like `'N/A'`, `'0'` or the string `'null'` are invisible to both `IS NULL` and `= ''`
+
+**Dialect notes**
+- Postgres: `LENGTH()` counts characters
+- MySQL: `LENGTH()` counts bytes, use `CHAR_LENGTH()` for characters
+- SQL Server: use `LEN()` (it also ignores trailing spaces)
+- Postgres `TRIM` removes spaces only by default. Tabs and newlines survive, so `E'\t'` shows as length 1
 
 ### COALESCE(value, fallback)
 Returns the first non-NULL argument in the list:
@@ -1287,3 +1314,4 @@ A result of 0 means a missing `NULLS LAST` was safe on this dataset only, not in
 - Every filter phrase in the question ("from the financial sector", "in 2022", "completed orders") must map to a visible `WHERE` clause. An accepted answer does not prove the filter is unnecessary, since the test data may simply not exercise it
 - Before sorting or ranking a nullable column, decide what NULLs should do. Don't rely on spotting NULLs in the output, since a rank-1-only query hides them. Postgres/Oracle: `DESC` puts NULLs first, use `NULLS LAST` or `IS NOT NULL`. MySQL/SQL Server: `DESC` already puts NULLs last and `NULLS LAST` is a syntax error. Portable option: `IS NOT NULL` filter or a `CASE` sort
 - Treat "accepted" as evidence about the output on one dataset, not proof the query is right: probe with an unfiltered top-N, check ties, count NULLs
+- Before filtering on a "blank" or "not provided" column, probe how the data encodes it (`LENGTH(TRIM(col))` distribution with `COUNT(*)`), then write the filter the data justifies: `IS NULL` alone if only NULLs exist, `IS NULL OR TRIM(col) = ''` if empty or whitespace values exist. A defensive branch is dead logic on the data you probed, but a live system may allow other blanks later
