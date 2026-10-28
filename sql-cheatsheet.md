@@ -285,6 +285,34 @@ FROM reviews
 GROUP BY EXTRACT(MONTH FROM submit_date), product_id;
 ```
 
+**Positional references (`GROUP BY 1`, `ORDER BY 1`):** the number is a position in the SELECT list, not a value. `GROUP BY 1` means "group by whichever expression is first in the SELECT list", and `GROUP BY 1, 2` is the composite-bucket version of the first two slots. An aggregate can't be a GROUP BY target, so pointing at an aggregate's slot is an error.
+```sql
+-- These two are equivalent
+SELECT country, device_type, COUNT(*) AS n
+FROM user_activity
+GROUP BY country, device_type;
+
+SELECT country, device_type, COUNT(*) AS n
+FROM user_activity
+GROUP BY 1, 2;
+```
+- [FACT] Supported in PostgreSQL and MySQL. Not strict ANSI SQL. SQL Server rejects it in `GROUP BY` (it does accept it in `ORDER BY`).
+- Fragile: if someone reorders or inserts a column in the SELECT list, `GROUP BY 1` silently points at something different, and on a wide query a reader has to count columns to know what is grouped.
+- [OPINION] Fine for quick exploration and worth being able to read in other people's queries. For anything committed to a portfolio or production, write the explicit expression, which is also the portable habit already recommended for aliases above.
+
+**`SELECT DISTINCT` plus `GROUP BY` on the same columns is redundant.** `GROUP BY` already returns one row per group, so `DISTINCT` does nothing. Drop it, because a habitual `DISTINCT` can mask a missing `GROUP BY` or a bad join elsewhere in a query.
+```sql
+-- Redundant DISTINCT
+SELECT DISTINCT TO_CHAR(shipment_date, 'YYYY-MM') AS year_month, COUNT(*) AS n
+FROM shipments
+GROUP BY TO_CHAR(shipment_date, 'YYYY-MM');
+
+-- Same result, no noise
+SELECT TO_CHAR(shipment_date, 'YYYY-MM') AS year_month, COUNT(*) AS n
+FROM shipments
+GROUP BY TO_CHAR(shipment_date, 'YYYY-MM');
+```
+
 **Two-level aggregation ("histogram" pattern):** a distribution or histogram question isn't a special SQL feature, it's just GROUP BY applied twice. Step 1: compute a per-entity number via GROUP BY + aggregate. Step 2: wrap step 1 in a CTE, then GROUP BY the resulting number itself, counting how many entities landed on each value:
 ```sql
 WITH employee_query_counts AS (
@@ -552,13 +580,6 @@ FROM viewership;
 
 **What goes inside THEN determines what's being aggregated.** `THEN 1` counts matching *rows* (occurrences). `THEN <column>` sums that column's actual *value* across matching rows. These give genuinely different numbers, e.g. "how many send events happened" (THEN 1) vs "how much total time was spent on send events" (THEN time_spent). Check the question's phrasing: "how many"/"count of"/"number of" → THEN 1; "total"/"sum of"/"amount of [quantity]" → THEN the actual column.
 
-### Ratio of matching rows: AVG over a 0/1 flag
-```sql
-SELECT AVG(CASE WHEN phone_number IS NULL THEN 1.0 ELSE 0 END) AS null_phone_ratio
-FROM employees;
-```
-The average of a 0/1 flag is the proportion of rows where the flag is 1, so no second aggregate and no cast are needed. The `1.0` makes the result numeric, avoiding integer truncation. **This is the one place `ELSE 0` is required**, because every row must contribute to the denominator. It is the opposite of the `COUNT(CASE...)` rule, where an `ELSE` breaks the count. An empty table returns NULL (no error), unlike the two-aggregate division, which errors on divide-by-zero (see NULLIF under NULL Handling).
-
 ### FILTER (WHERE...): Postgres alternative to SUM(CASE WHEN...)
 ```sql
 -- Equivalent to SUM(CASE WHEN activity_type = 'send' THEN time_spent ELSE 0 END)
@@ -592,7 +613,6 @@ E.g. computing a mean from pre-aggregated/compressed data where each row represe
 - `COUNT(column)` counts only non-NULL values in that column
 - Only identical if the column can never be NULL
 - Default to `COUNT(*)` unless specifically counting non-null occurrences of one column; `COUNT(column)` silently undercounts if that column can contain NULLs
-- `COUNT(*) - COUNT(column)` gives the number of NULLs in `column` directly, with no CASE needed
 
 ### Don't filter NOT NULL in WHERE and then COUNT(column)
 `WHERE col IS NOT NULL` combined with `COUNT(col)` does the same job twice. Pick one place for the NULL logic:
@@ -603,6 +623,45 @@ The placement changes the output when a question says "for each X" and some X va
 
 ### COUNT(DISTINCT column)
 Counts distinct non-NULL values only. Avoids double-counting duplicate rows for the same entity (e.g. multiple log rows for the same query_id), and naturally gives 0 for an entity with no matching rows at all, e.g. after a LEFT JOIN with no match.
+
+### Counting entities defined by a composite key
+When the spec says the unique key is a **combination** of columns (e.g. `shipment_id` plus `sub_id`), the count must be taken over that combination. Counting one component is wrong in both directions:
+- `COUNT(shipment_id)` counts rows. It equals the number of shipments only if every row is already one unique key pair with a non-NULL `shipment_id`. A duplicated row overcounts, a NULL is skipped, and nothing errors.
+- `COUNT(DISTINCT shipment_id)` undercounts, because one `shipment_id` can carry several `sub_id` values, each of which is its own shipment.
+
+```sql
+-- PostgreSQL: row constructor inside COUNT(DISTINCT ...)
+SELECT TO_CHAR(shipment_date, 'YYYY-MM') AS year_month,
+       COUNT(DISTINCT (shipment_id, sub_id)) AS shipment_count
+FROM shipments
+GROUP BY TO_CHAR(shipment_date, 'YYYY-MM')
+ORDER BY year_month;
+
+-- Portable: deduplicate on the key in a subquery, then count the outer rows
+SELECT year_month, COUNT(*) AS shipment_count
+FROM (
+    SELECT DISTINCT shipment_id, sub_id, TO_CHAR(shipment_date, 'YYYY-MM') AS year_month
+    FROM shipments
+) AS unique_shipments
+GROUP BY year_month
+ORDER BY year_month;
+```
+- [FACT] `COUNT(DISTINCT (a, b))` with a row constructor works in PostgreSQL. It is not portable to MySQL or SQL Server, so use the subquery form there. (`TO_CHAR` is also Postgres/Oracle-specific; the date-formatting function differs per engine.)
+- [FACT] A row constructor is itself a non-NULL value in Postgres, so a pair with a NULL component is still counted, unlike `COUNT(DISTINCT single_column)` which skips NULLs. Check for NULL key parts separately if the spec could be affected.
+- **Prove whether the gap matters on your data** instead of assuming:
+```sql
+-- Any duplicate key pairs?
+SELECT shipment_id, sub_id, COUNT(*) AS copies
+FROM shipments
+GROUP BY shipment_id, sub_id
+HAVING COUNT(*) > 1;
+
+-- Any NULL key parts?
+SELECT COUNT(*) AS null_key_rows
+FROM shipments
+WHERE shipment_id IS NULL OR sub_id IS NULL;
+```
+If both come back empty, the row-count version and the composite-key version give identical output on this data. That makes the simpler query accepted, not correct by design. The composite-key version is the one that stays right when the data changes.
 
 ### COUNT(CASE...) vs SUM(CASE...): a silent trap
 If the CASE has an `ELSE` that returns a real value (e.g. `ELSE 0`), **every** row produces a non-NULL result regardless of whether the condition matched. So:
@@ -781,46 +840,19 @@ WHERE payments.payment_id != NULL
 - WHERE only includes rows where the condition is TRUE, so NULL comparisons silently exclude rows
 - LEFT JOIN + IS NULL is the standard pattern for finding missing related records
 
-### "Blank" can mean NULL, an empty string, or whitespace
-These are three different values and need different checks:
+### "Blank" can mean NULL or an empty string
+These are different values and need different checks:
 - `col IS NULL` catches missing values only
 - `col = ''` catches empty strings only
-- `TRIM(col) = ''` catches empty strings AND whitespace-only values like `'   '`
-- `IS NOT NULL` and `COUNT(col)` treat `''` and `' '` as real values, so they pass straight through
+- `IS NOT NULL` and `COUNT(col)` both treat `''` as a real value, so empty strings pass straight through
 
-When a problem says a column is "empty", "missing" or "not provided", check how the data actually encodes it before filtering. Probe the distribution of cleaned lengths in one pass:
+When a problem says a column is "empty" or "will contain a value only if...", check which one the data uses before filtering:
 ```sql
-SELECT LENGTH(TRIM(phone_number)) AS len, COUNT(*) AS n
-FROM fintech_app_users
-GROUP BY LENGTH(TRIM(phone_number))
-ORDER BY len;
+SELECT COUNT(*) FILTER (WHERE col IS NULL) AS null_rows,
+       COUNT(*) FILTER (WHERE col = '')    AS empty_string_rows
+FROM table_name;
 ```
-
-**How to read it**
-- Nested functions evaluate inside out: `LENGTH(TRIM(col))` means "clean the value first, then measure it"
-- `TRIM` removes leading and trailing spaces only, not spaces in the middle
-- A whitespace-only value has a raw `LENGTH` above 0, so it looks like real data until `TRIM` reduces it to `''`
-- `len = 0` means empty string or whitespace-only
-- A NULL input gives a NULL length, so missing values form their own group (blank in the results grid, sorted last on `ASC` in Postgres). Add `col IS NULL` to the SELECT list to confirm
-- Short lengths reveal placeholders: `'N/A'` is 3, `'null'` is 4, `'0'` is 1
-- Use `COUNT(*)`, not `COUNT(col)`, so the NULL group is counted
-- Repeat the full expression in `GROUP BY` rather than the alias (portable)
-- This is two-level aggregation in miniature: compute a per-row number, then group by that number
-
-**Decide from the output**
-- Only NULLs found: `WHERE col IS NULL` is correct, and a `TRIM` branch would be dead logic on that data
-- Empty or whitespace values found: `WHERE col IS NULL OR TRIM(col) = ''`
-- "Dead logic" is a statement about the data you probed, not the column's rules. For a fixed practice dataset the probe settles it. For a live system, check for a constraint or ask the schema owner, because the column may allow other blanks later
-
-**Limits of the probe**
-- Length cannot catch a junk value of plausible length such as `'0000000000'`. Look at the distinct values themselves
-- Placeholders like `'N/A'`, `'0'` or the string `'null'` are invisible to both `IS NULL` and `= ''`
-
-**Dialect notes**
-- Postgres: `LENGTH()` counts characters
-- MySQL: `LENGTH()` counts bytes, use `CHAR_LENGTH()` for characters
-- SQL Server: use `LEN()` (it also ignores trailing spaces)
-- Postgres `TRIM` removes spaces only by default. Tabs and newlines survive, so `E'\t'` shows as length 1
+Portable version: replace each `FILTER` with `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`.
 
 ### COALESCE(value, fallback)
 Returns the first non-NULL argument in the list:
@@ -828,12 +860,6 @@ Returns the first non-NULL argument in the list:
 COALESCE(deposit.deposit_total, 0) - COALESCE(withdrawal.withdrawal_total, 0)
 ```
 Use to substitute a default when a value could be NULL from a join's unmatched side (e.g. after a FULL OUTER JOIN). Without it, `NULL - 5` or `5 - NULL` evaluates to NULL for the whole expression, silently losing an otherwise fully-knowable row.
-
-### NULLIF(value, comparison): the divide-by-zero guard
-```sql
-SUM(a)::NUMERIC / NULLIF(COUNT(*), 0)
-```
-`NULLIF(x, y)` returns NULL if `x = y`, otherwise `x`. Dividing by NULL gives NULL instead of a hard "division by zero" error. Use it on any denominator that could be 0 on an empty or heavily filtered slice. If a 0 should display instead of NULL, wrap the whole expression in `COALESCE(..., 0)`, but only when "no data" and "zero" mean the same thing for the reader.
 
 ---
 
@@ -992,6 +1018,16 @@ WHERE department = 'Admin'
   AND EXTRACT(MONTH FROM joining_date) >= 4;
 ```
 Both conditions are row-level filters, so both belong in `WHERE`, with `COUNT(*)` on top. Returns 0 (not NULL) even if no row qualifies. The `SUM(CASE WHEN ...)` version works on typical data but returns NULL when the `WHERE` empties the row set, and it is the wrong tool for a single condition (see Aggregates Over an Empty Row Set).
+
+### Count entities per period when the unique key is composite
+```sql
+SELECT TO_CHAR(shipment_date, 'YYYY-MM') AS year_month,
+       COUNT(DISTINCT (shipment_id, sub_id)) AS shipment_count
+FROM shipments
+GROUP BY TO_CHAR(shipment_date, 'YYYY-MM')
+ORDER BY year_month;
+```
+The spec's key definition is part of the requirement, so the count is over the whole key, not one component column. See "Counting entities defined by a composite key" above for the duplicate and NULL probes, and the portable subquery form for MySQL/SQL Server.
 
 ### Find records below a threshold
 ```sql
@@ -1260,8 +1296,10 @@ An automated checker only compares your output with the expected output on **one
 
 **Worked case:** a question asked for the most profitable company *from the financial sector*. A query with no sector filter at all was accepted. The reason: the top-profit company overall was also a financial company, so the filtered and unfiltered queries returned the same row. The data could not tell the two queries apart.
 
+**Second worked case:** a question defined the unique key of a shipment as `shipment_id` plus `sub_id`, and asked for shipments per month. A query using `COUNT(shipment_id)` was accepted. It counts rows, not key pairs, so it only matches when the table has no duplicate pairs and no NULL `shipment_id`. The checker passing says the data did not exercise the gap, not that the query encodes the spec.
+
 How to catch this yourself:
-1. **Map every phrase of the question to a clause before submitting.** A category ("from the financial sector"), a date range, a status, a "per group": each one should have a visible `WHERE`, `GROUP BY` or `PARTITION BY`. A phrase with no matching clause is a missing filter until proven otherwise.
+1. **Map every phrase of the question to a clause before submitting.** A category ("from the financial sector"), a date range, a status, a "per group", a stated unique key: each one should have a visible `WHERE`, `GROUP BY`, `PARTITION BY` or a count over the stated key. A phrase with no matching clause is a missing filter until proven otherwise.
 2. **Probe the data for what could have masked a bug.** Run an unfiltered top-N and look at the columns you filtered on:
 ```sql
 SELECT company, continent, sector, profits
@@ -1277,7 +1315,8 @@ FROM forbes_global_2010_2014
 WHERE profits IS NULL;
 ```
 A result of 0 means a missing `NULLS LAST` was safe on this dataset only, not in general.
-4. **Treat "it passed" as evidence about the output, not about the query.** Defensive habits (explicit filters, `RANK` over `ROW_NUMBER`, explicit NULL handling) cost almost nothing and keep the query correct when the data changes.
+4. **Check for duplicates on any stated unique key** with `GROUP BY <key columns> HAVING COUNT(*) > 1`. Empty output means the row-count and key-count versions agree on this data only.
+5. **Treat "it passed" as evidence about the output, not about the query.** Defensive habits (explicit filters, `RANK` over `ROW_NUMBER`, explicit NULL handling, counting over the stated key) cost almost nothing and keep the query correct when the data changes.
 
 ---
 
@@ -1313,5 +1352,7 @@ A result of 0 means a missing `NULLS LAST` was safe on this dataset only, not in
 - Before writing a query, underline the exact verbs and quantities in the question ("starts with", "contains", "anywhere", "all columns", "distinct", "per group") and map each one to a specific clause or pattern. Most wrong answers on simple questions are spec-reading gaps, not SQL gaps
 - Every filter phrase in the question ("from the financial sector", "in 2022", "completed orders") must map to a visible `WHERE` clause. An accepted answer does not prove the filter is unnecessary, since the test data may simply not exercise it
 - Before sorting or ranking a nullable column, decide what NULLs should do. Don't rely on spotting NULLs in the output, since a rank-1-only query hides them. Postgres/Oracle: `DESC` puts NULLs first, use `NULLS LAST` or `IS NOT NULL`. MySQL/SQL Server: `DESC` already puts NULLs last and `NULLS LAST` is a syntax error. Portable option: `IS NOT NULL` filter or a `CASE` sort
-- Treat "accepted" as evidence about the output on one dataset, not proof the query is right: probe with an unfiltered top-N, check ties, count NULLs
-- Before filtering on a "blank" or "not provided" column, probe how the data encodes it (`LENGTH(TRIM(col))` distribution with `COUNT(*)`), then write the filter the data justifies: `IS NULL` alone if only NULLs exist, `IS NULL OR TRIM(col) = ''` if empty or whitespace values exist. A defensive branch is dead logic on the data you probed, but a live system may allow other blanks later
+- Treat "accepted" as evidence about the output on one dataset, not proof the query is right: probe with an unfiltered top-N, check ties, count NULLs, check duplicates on any stated unique key
+- When the spec defines a composite unique key, count over the whole key (`COUNT(DISTINCT (a, b))` in Postgres, a deduplicating subquery elsewhere), never over one component column
+- Don't pair `SELECT DISTINCT` with `GROUP BY` on the same columns, it is redundant and can hide a missing `GROUP BY` or a bad join
+- Prefer the explicit expression over positional `GROUP BY 1` / `ORDER BY 1` in anything you commit. Positional references are Postgres/MySQL-only and break silently when the SELECT list is reordered, though you should be able to read them in other people's queries
